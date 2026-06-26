@@ -36,6 +36,9 @@ final class AppModel: ObservableObject {
     private var captchaContinuation: CheckedContinuation<String?, Never>?
     private var lastSignature: String = ""
     private var cancellables = Set<AnyCancellable>()
+    private var loginGeneration = 0
+    private var probeGeneration = 0
+    private var isLogoutInProgress = false
 
     init() {
         let loaded = configStore.load()
@@ -66,7 +69,14 @@ final class AppModel: ObservableObject {
     }
 
     func login(account: MultiLoginAccount? = nil) {
+        guard !isLogoutInProgress else {
+            log("正在注销，已忽略登录请求")
+            return
+        }
         loginTask?.cancel()
+        cancelPendingCaptcha()
+        loginGeneration += 1
+        let generation = loginGeneration
 
         let username = account?.username.isEmpty == false ? account!.username : settings.username
         let userIP = account?.userIP.isEmpty == false ? account!.userIP : settings.wlanUserIP
@@ -94,15 +104,20 @@ final class AppModel: ObservableObject {
                         await self?.requestCaptcha(
                             imageData: imageData,
                             title: "输入登录验证码",
-                            submitTitle: "继续登录"
+                            submitTitle: "继续登录",
+                            generation: generation
                         )
                     },
                     logger: { [weak self] message in
-                        Task { @MainActor in self?.log(message) }
+                        Task { @MainActor in
+                            guard let self, self.isCurrentLogin(generation) else { return }
+                            self.log(message)
+                        }
                     }
                 )
 
                 await MainActor.run {
+                    guard self.isCurrentLogin(generation) else { return }
                     if result.success {
                         self.connectionState = .connected(result.message)
                         self.lastSignature = result.signature ?? ""
@@ -119,23 +134,35 @@ final class AppModel: ObservableObject {
                     }
                 }
             } catch is CancellationError {
-                await MainActor.run { self.log("登录已取消") }
+                await MainActor.run {
+                    guard self.isCurrentLogin(generation) else { return }
+                    self.log("登录已取消")
+                }
             } catch {
-                await MainActor.run { self.fail(error.localizedDescription) }
+                await MainActor.run {
+                    guard self.isCurrentLogin(generation) else { return }
+                    self.fail(error.localizedDescription)
+                }
             }
         }
     }
 
     func logout() {
+        isLogoutInProgress = true
+        loginGeneration += 1
+        probeGeneration += 1
         loginTask?.cancel()
+        cancelPendingCaptcha()
+        isProbing = false
+        stopWatchdog()
         guard !lastSignature.isEmpty else {
             log("您尚未登录，无需下线！")
+            isLogoutInProgress = false
             return
         }
 
         connectionState = .loggingOut
         log("开始注销")
-        stopWatchdog()
         Task {
             do {
                 await MainActor.run {
@@ -150,11 +177,15 @@ final class AppModel: ObservableObject {
                 await MainActor.run {
                     self.connectionState = .idle
                     self.lastSignature = ""
+                    self.isLogoutInProgress = false
                     self.log("成功发送下线请求")
                     self.log(message)
                 }
             } catch {
-                await MainActor.run { self.fail("下线失败：\(error.localizedDescription)") }
+                await MainActor.run {
+                    self.isLogoutInProgress = false
+                    self.fail("下线失败：\(error.localizedDescription)")
+                }
             }
         }
     }
@@ -229,12 +260,21 @@ final class AppModel: ObservableObject {
 
     func checkConnectivity() {
         guard !isProbing else { return }
+        guard !isLogoutInProgress, connectionState != .loggingOut else { return }
         isProbing = true
+        probeGeneration += 1
+        let generation = probeGeneration
         log("开始访问目标检测")
         Task { [weak self] in
             guard let self else { return }
             let results = await probeService.measure(urlStrings: settings.probeURLs)
             await MainActor.run {
+                guard generation == self.probeGeneration,
+                      !self.isLogoutInProgress,
+                      self.connectionState != .loggingOut else {
+                    self.isProbing = false
+                    return
+                }
                 self.probeResults = results
                 self.isProbing = false
                 if let fastest = results.filter(\.success).compactMap(\.latencyMS).min() {
@@ -255,12 +295,16 @@ final class AppModel: ObservableObject {
             hasLocalIP: { NetworkInterfaceService.localIPv4Address() != nil },
             reconnect: { [weak self] in
                 Task { @MainActor in
-                    self?.log("看门狗触发重连")
-                    self?.login()
+                    guard let self, !self.isLogoutInProgress, self.connectionState != .loggingOut else { return }
+                    self.log("看门狗触发重连")
+                    self.login()
                 }
             },
             logger: { [weak self] message in
-                Task { @MainActor in self?.log(message) }
+                Task { @MainActor in
+                    guard let self, !self.isLogoutInProgress, self.connectionState != .loggingOut else { return }
+                    self.log(message)
+                }
             }
         )
         watchdog = service
@@ -406,8 +450,25 @@ final class AppModel: ObservableObject {
         return true
     }
 
-    private func requestCaptcha(imageData: Data, title: String, submitTitle: String) async -> String? {
-        await withCheckedContinuation { continuation in
+    private func isCurrentLogin(_ generation: Int) -> Bool {
+        generation == loginGeneration && !isLogoutInProgress && connectionState != .loggingOut
+    }
+
+    private func cancelPendingCaptcha() {
+        captchaContinuation?.resume(returning: nil)
+        captchaContinuation = nil
+        captchaChallenge = nil
+        captchaInput = ""
+    }
+
+    private func requestCaptcha(imageData: Data, title: String, submitTitle: String, generation: Int? = nil) async -> String? {
+        if let generation, !isCurrentLogin(generation) {
+            return nil
+        }
+        guard !isLogoutInProgress, connectionState != .loggingOut else {
+            return nil
+        }
+        return await withCheckedContinuation { continuation in
             captchaContinuation = continuation
             captchaTitle = title
             captchaSubmitTitle = submitTitle
