@@ -200,10 +200,10 @@ final class AuthenticationService {
         return classifyLoginResponse(response.text, cookies: response.cookies)
     }
 
-    func logout(settings: AppSettings, userIP: String, account: String, signature: String) async throws {
+    func logout(settings: AppSettings, userIP: String, account: String, signature: String) async throws -> String {
         let base = normalizeBaseURL(settings.esurfingURL)
         let endpoint = try url("\(base)/ajax/logout")
-        _ = try await postForm(
+        let response = try await postForm(
             endpoint,
             payload: [
                 "wlanuserip": userIP,
@@ -213,6 +213,7 @@ final class AuthenticationService {
                 "Cookie": "signature=\(signature); loginUser=\(account)"
             ]
         )
+        return try classifyLogoutResponse(response.text)
     }
 
     func detectParameters() async throws -> CampusParameters {
@@ -315,6 +316,22 @@ final class AuthenticationService {
             return LoginResult(success: false, message: "网关返回空响应", signature: nil)
         }
         return LoginResult(success: false, message: response, signature: nil)
+    }
+
+    private func classifyLogoutResponse(_ response: String) throws -> String {
+        guard !response.isEmpty else {
+            throw AppError.requestFailed("网关返回空响应")
+        }
+        if let data = response.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let code = String(describing: json["resultCode"] ?? "")
+            let info = String(describing: json["resultInfo"] ?? "下线成功")
+            if code == "0" || code == "13002000" {
+                return "下线成功"
+            }
+            throw AppError.requestFailed("\(info)（\(code)）")
+        }
+        throw AppError.requestFailed(response)
     }
 
     private func extractCaptchaURL(from html: String, pageURL: URL) -> URL? {

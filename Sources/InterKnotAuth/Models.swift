@@ -38,6 +38,7 @@ enum LoginMode: String, Codable, CaseIterable, Identifiable {
 enum ConnectionState: Equatable {
     case idle
     case loggingIn
+    case loggingOut
     case connected(String)
     case failed(String)
 
@@ -47,6 +48,8 @@ enum ConnectionState: Equatable {
             return "未连接"
         case .loggingIn:
             return "登录中"
+        case .loggingOut:
+            return "注销中"
         case .connected:
             return "已连接"
         case .failed:
@@ -60,6 +63,8 @@ enum ConnectionState: Equatable {
             return "等待认证"
         case .loggingIn:
             return "正在和 ESurfing 网关通信"
+        case .loggingOut:
+            return "正在下线"
         case .connected(let message):
             return message
         case .failed(let message):

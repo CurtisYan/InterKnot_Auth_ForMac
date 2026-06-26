@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import SwiftUI
 
@@ -34,6 +35,7 @@ final class AppModel: ObservableObject {
     private var loginTask: Task<Void, Never>?
     private var captchaContinuation: CheckedContinuation<String?, Never>?
     private var lastSignature: String = ""
+    private var cancellables = Set<AnyCancellable>()
 
     init() {
         let loaded = configStore.load()
@@ -41,6 +43,7 @@ final class AppModel: ObservableObject {
         password = credentialStore.password(for: loaded.username) ?? ""
         log("欢迎使用 InterKnot for macOS")
         log("配置已加载")
+        bindAutoSave()
 
         if loaded.autoShare {
             startEasyTierServer()
@@ -54,10 +57,7 @@ final class AppModel: ObservableObject {
     }
 
     func saveSettings() {
-        configStore.save(settings)
-        if settings.savePassword, !settings.username.isEmpty, !password.isEmpty {
-            credentialStore.save(password: password, for: settings.username)
-        }
+        persistSettings(settings)
         log("配置已保存")
     }
 
@@ -128,20 +128,26 @@ final class AppModel: ObservableObject {
 
     func logout() {
         loginTask?.cancel()
+        guard !lastSignature.isEmpty else {
+            log("您尚未登录，无需下线！")
+            return
+        }
+
+        connectionState = .loggingOut
+        log("开始注销")
         Task {
             do {
-                let signature = try await signatureForLogout()
-                try await authenticator.logout(
+                let message = try await authenticator.logout(
                     settings: settings,
                     userIP: resolvedUserIP(),
                     account: settings.username,
-                    signature: signature
+                    signature: lastSignature
                 )
                 await MainActor.run {
                     self.stopWatchdog()
                     self.connectionState = .idle
                     self.lastSignature = ""
-                    self.log("注销成功")
+                    self.log(message)
                 }
             } catch {
                 await MainActor.run { self.fail("下线失败：\(error.localizedDescription)") }
@@ -321,6 +327,42 @@ final class AppModel: ObservableObject {
         Logger.write("[\(level)] \(message)")
     }
 
+    private func bindAutoSave() {
+        $settings
+            .dropFirst()
+            .removeDuplicates()
+            .debounce(for: .milliseconds(600), scheduler: RunLoop.main)
+            .sink { [weak self] settings in
+                Task { @MainActor in
+                    self?.persistSettings(settings)
+                }
+            }
+            .store(in: &cancellables)
+
+        $password
+            .dropFirst()
+            .debounce(for: .milliseconds(600), scheduler: RunLoop.main)
+            .sink { [weak self] password in
+                Task { @MainActor in
+                    self?.persistPassword(password)
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func persistSettings(_ settings: AppSettings) {
+        configStore.save(settings)
+        persistPassword(password)
+    }
+
+    private func persistPassword(_ password: String) {
+        if settings.savePassword, !settings.username.isEmpty, !password.isEmpty {
+            credentialStore.save(password: password, for: settings.username)
+        } else if !settings.savePassword, !settings.username.isEmpty {
+            credentialStore.delete(account: settings.username)
+        }
+    }
+
     private func resolvedUserIP() -> String {
         if !settings.wlanUserIP.isEmpty, settings.wlanUserIP != "0.0.0.0" {
             return settings.wlanUserIP
@@ -368,55 +410,6 @@ final class AppModel: ObservableObject {
             captchaChallenge = CaptchaChallenge(imageData: imageData)
             captchaInput = ""
         }
-    }
-
-    private func signatureForLogout() async throws -> String {
-        if !lastSignature.isEmpty {
-            log("开始注销")
-            return lastSignature
-        }
-
-        let request = LoginRequest(
-            username: settings.username,
-            password: password,
-            userIP: settings.wlanUserIP,
-            mode: settings.loginMode
-        )
-        guard validateBeforeLogin(request: request) else {
-            throw AppError.requestFailed(validationMessage)
-        }
-
-        await MainActor.run {
-            self.connectionState = .loggingIn
-            self.log("注销前需要获取下线签名")
-        }
-
-        let result = try await authenticator.login(
-            request: request,
-            settings: settings,
-            captchaProvider: { [weak self] imageData in
-                await self?.requestCaptcha(
-                    imageData: imageData,
-                    title: "输入注销验证码",
-                    submitTitle: "继续注销"
-                )
-            },
-            logger: { [weak self] message in
-                Task { @MainActor in self?.log("注销准备：\(message)") }
-            }
-        )
-
-        guard result.success else {
-            throw AppError.requestFailed(result.message)
-        }
-        guard let signature = result.signature, !signature.isEmpty else {
-            throw AppError.requestFailed("未获取到下线签名")
-        }
-        await MainActor.run {
-            self.lastSignature = signature
-            self.log("已获取下线签名")
-        }
-        return signature
     }
 
     private func runSingleMultiLogin(request: LoginRequest, label: String) async {

@@ -188,12 +188,6 @@ private struct DashboardView: View {
                         } label: {
                             Label("自动获取认证参数", systemImage: "wand.and.stars")
                         }
-
-                        Button {
-                            model.saveSettings()
-                        } label: {
-                            Label("保存配置", systemImage: "square.and.arrow.down")
-                        }
                     }
                 }
 
@@ -286,9 +280,8 @@ private struct AccountView: View {
 
             Section {
                 HStack {
-                    Button("保存") { model.saveSettings() }
-                        .buttonStyle(.borderedProminent)
                     Button("登录") { model.login() }
+                        .buttonStyle(.borderedProminent)
                     Button("注销") { model.logout() }
                 }
             }
@@ -363,7 +356,6 @@ private struct NetworkSettingsView: View {
                 }
             }
 
-            Button("保存参数") { model.saveSettings() }
         }
         .formStyle(.grouped)
         .padding(18)
@@ -411,7 +403,6 @@ private struct MultiLoginView: View {
             }
 
             HStack {
-                Button("保存多拨配置") { model.saveSettings() }
                 Button(role: .destructive) {
                     model.settings.multiAccounts.removeAll { !$0.enabled && $0.username.isEmpty }
                 } label: {
@@ -464,7 +455,6 @@ private struct TunnelView: View {
                     .font(.caption)
             }
 
-            Button("保存隧道配置") { model.saveSettings() }
         }
         .formStyle(.grouped)
         .padding(18)
