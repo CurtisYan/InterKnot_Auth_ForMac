@@ -6,6 +6,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case network = "认证参数"
     case multiLogin = "多拨"
     case tunnel = "隧道"
+    case settings = "设置"
 
     var id: String { rawValue }
 }
@@ -95,6 +96,7 @@ struct AppSettings: Codable, Equatable {
     var username: String = ""
     var savePassword: Bool = true
     var autoConnect: Bool = false
+    var launchAtLogin: Bool = false
     var enableWatchdog: Bool = true
     var autoShare: Bool = false
     var autoUpdateUserIP: Bool = false
@@ -115,6 +117,51 @@ struct AppSettings: Codable, Equatable {
     var easyTier: EasyTierSettings = EasyTierSettings()
 
     static let empty = AppSettings()
+
+    enum CodingKeys: String, CodingKey {
+        case username
+        case savePassword
+        case autoConnect
+        case launchAtLogin
+        case enableWatchdog
+        case autoShare
+        case autoUpdateUserIP
+        case loginMode
+        case esurfingURL
+        case wlanACIP
+        case wlanUserIP
+        case watchdogTimeout
+        case probeURLs
+        case rsaPublicKey
+        case multiAccounts
+        case easyTier
+    }
+
+    init() { }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        username = try container.decodeIfPresent(String.self, forKey: .username) ?? ""
+        savePassword = try container.decodeIfPresent(Bool.self, forKey: .savePassword) ?? true
+        autoConnect = try container.decodeIfPresent(Bool.self, forKey: .autoConnect) ?? false
+        launchAtLogin = try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
+        enableWatchdog = try container.decodeIfPresent(Bool.self, forKey: .enableWatchdog) ?? true
+        autoShare = try container.decodeIfPresent(Bool.self, forKey: .autoShare) ?? false
+        autoUpdateUserIP = try container.decodeIfPresent(Bool.self, forKey: .autoUpdateUserIP) ?? false
+        loginMode = try container.decodeIfPresent(LoginMode.self, forKey: .loginMode) ?? .automatic
+        esurfingURL = try container.decodeIfPresent(String.self, forKey: .esurfingURL) ?? "enet.10000.gd.cn:10001"
+        wlanACIP = try container.decodeIfPresent(String.self, forKey: .wlanACIP) ?? "0.0.0.0"
+        wlanUserIP = try container.decodeIfPresent(String.self, forKey: .wlanUserIP) ?? "0.0.0.0"
+        watchdogTimeout = try container.decodeIfPresent(Int.self, forKey: .watchdogTimeout) ?? 5
+        probeURLs = try container.decodeIfPresent([String].self, forKey: .probeURLs) ?? [
+            "https://www.apple.com/library/test/success.html",
+            "https://www.baidu.com",
+            "https://www.qq.com"
+        ]
+        rsaPublicKey = try container.decodeIfPresent(String.self, forKey: .rsaPublicKey) ?? AppSettings.defaultRSAPublicKey
+        multiAccounts = try container.decodeIfPresent([MultiLoginAccount].self, forKey: .multiAccounts) ?? []
+        easyTier = try container.decodeIfPresent(EasyTierSettings.self, forKey: .easyTier) ?? EasyTierSettings()
+    }
 
     static let defaultRSAPublicKey = """
     -----BEGIN PUBLIC KEY-----

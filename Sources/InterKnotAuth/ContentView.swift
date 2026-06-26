@@ -62,6 +62,7 @@ private struct SidebarView: View {
         case .network: return "network"
         case .multiLogin: return "square.stack.3d.up"
         case .tunnel: return "point.3.connected.trianglepath.dotted"
+        case .settings: return "gearshape"
         }
     }
 }
@@ -105,6 +106,8 @@ private struct MainDetailContent: View {
                     MultiLoginView()
                 case .tunnel:
                     TunnelView()
+                case .settings:
+                    SettingsView()
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -268,8 +271,6 @@ private struct AccountView: View {
                     text: $model.password,
                     isMissing: model.missingFields.contains(.password)
                 )
-                Toggle("记住密码到 macOS Keychain", isOn: $model.settings.savePassword)
-                Toggle("启动后自动登录", isOn: $model.settings.autoConnect)
                 Picker("登录模式", selection: $model.settings.loginMode) {
                     ForEach(LoginMode.allCases) { mode in
                         Text(mode.rawValue).tag(mode)
@@ -288,6 +289,52 @@ private struct AccountView: View {
         }
         .formStyle(.grouped)
         .padding(18)
+    }
+}
+
+private struct SettingsView: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        Form {
+            Section("启动") {
+                Toggle("开机自动启动", isOn: $model.settings.launchAtLogin)
+                Toggle("启动后自动登录", isOn: $model.settings.autoConnect)
+                    .onChange(of: model.settings.autoConnect) { enabled in
+                        if enabled {
+                            model.settings.savePassword = true
+                        }
+                    }
+                Toggle("记住密码到 macOS Keychain", isOn: $model.settings.savePassword)
+                Text("启动后自动登录需要保存密码。开启自动登录时会同时开启 Keychain 保存。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("后台运行") {
+                Toggle("登录后开启看门狗", isOn: $model.settings.enableWatchdog)
+                HStack {
+                    Text("看门狗间隔")
+                        .frame(width: 110, alignment: .leading)
+                    TextField("秒", value: $model.settings.watchdogTimeout, format: .number)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 90)
+                    Text("秒")
+                        .foregroundStyle(.secondary)
+                }
+                Toggle("自动更新本机 IP", isOn: $model.settings.autoUpdateUserIP)
+            }
+
+            Section("网络共享") {
+                Toggle("启动后自动开启共享", isOn: $model.settings.autoShare)
+                Toggle("非本机访问 WebUI 时提供下载页", isOn: $model.settings.easyTier.enableWebDownload)
+            }
+        }
+        .formStyle(.grouped)
+        .padding(18)
+        .onAppear {
+            model.syncLaunchAtLoginStatus()
+        }
     }
 }
 
@@ -327,17 +374,6 @@ private struct NetworkSettingsView: View {
                 } label: {
                     Label("手动解析", systemImage: "link.badge.plus")
                 }
-                HStack {
-                    Text("看门狗间隔")
-                        .frame(width: 110, alignment: .leading)
-                    TextField("秒", value: $model.settings.watchdogTimeout, format: .number)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 90)
-                    Text("秒")
-                        .foregroundStyle(.secondary)
-                }
-                Toggle("登录后开启看门狗", isOn: $model.settings.enableWatchdog)
-                Toggle("自动更新本机 IP", isOn: $model.settings.autoUpdateUserIP)
             }
 
             Section("登录密钥") {

@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import ServiceManagement
 import SwiftUI
 
 @MainActor
@@ -39,6 +40,7 @@ final class AppModel: ObservableObject {
     private var loginGeneration = 0
     private var probeGeneration = 0
     private var isLogoutInProgress = false
+    private var isApplyingLaunchAtLogin = false
 
     init() {
         let loaded = configStore.load()
@@ -47,6 +49,7 @@ final class AppModel: ObservableObject {
         log("欢迎使用 InterKnot for macOS")
         log("配置已加载")
         bindAutoSave()
+        reconcileLaunchAtLogin()
 
         if loaded.autoShare {
             startEasyTierServer()
@@ -258,6 +261,10 @@ final class AppModel: ObservableObject {
         log("已恢复默认 RSA 公钥")
     }
 
+    func syncLaunchAtLoginStatus() {
+        settings.launchAtLogin = isLaunchAtLoginEnabled()
+    }
+
     func checkConnectivity() {
         guard !isProbing else { return }
         guard !isLogoutInProgress, connectionState != .loggingOut else { return }
@@ -387,6 +394,17 @@ final class AppModel: ObservableObject {
             }
             .store(in: &cancellables)
 
+        $settings
+            .map(\.launchAtLogin)
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] enabled in
+                Task { @MainActor in
+                    self?.applyLaunchAtLogin(enabled)
+                }
+            }
+            .store(in: &cancellables)
+
         $password
             .dropFirst()
             .debounce(for: .milliseconds(600), scheduler: RunLoop.main)
@@ -408,6 +426,41 @@ final class AppModel: ObservableObject {
             credentialStore.save(password: password, for: settings.username)
         } else if !settings.savePassword, !settings.username.isEmpty {
             credentialStore.delete(account: settings.username)
+        }
+    }
+
+    private func reconcileLaunchAtLogin() {
+        applyLaunchAtLogin(settings.launchAtLogin, quiet: true)
+    }
+
+    private func isLaunchAtLoginEnabled() -> Bool {
+        SMAppService.mainApp.status == .enabled
+    }
+
+    private func applyLaunchAtLogin(_ enabled: Bool, quiet: Bool = false) {
+        guard !isApplyingLaunchAtLogin else { return }
+        isApplyingLaunchAtLogin = true
+        defer { isApplyingLaunchAtLogin = false }
+
+        do {
+            if enabled {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
+                }
+                if !quiet {
+                    log("开机自动启动已开启")
+                }
+            } else {
+                if SMAppService.mainApp.status == .enabled {
+                    try SMAppService.mainApp.unregister()
+                }
+                if !quiet {
+                    log("开机自动启动已关闭")
+                }
+            }
+        } catch {
+            log("设置开机自动启动失败：\(error.localizedDescription)", level: "ERROR")
+            settings.launchAtLogin = isLaunchAtLoginEnabled()
         }
     }
 
