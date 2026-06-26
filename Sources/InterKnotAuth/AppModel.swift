@@ -135,8 +135,12 @@ final class AppModel: ObservableObject {
 
         connectionState = .loggingOut
         log("开始注销")
+        stopWatchdog()
         Task {
             do {
+                await MainActor.run {
+                    self.log("发送下线请求：\(self.resolvedUserIP())")
+                }
                 let message = try await authenticator.logout(
                     settings: settings,
                     userIP: resolvedUserIP(),
@@ -144,9 +148,9 @@ final class AppModel: ObservableObject {
                     signature: lastSignature
                 )
                 await MainActor.run {
-                    self.stopWatchdog()
                     self.connectionState = .idle
                     self.lastSignature = ""
+                    self.log("成功发送下线请求")
                     self.log(message)
                 }
             } catch {
