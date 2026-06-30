@@ -139,6 +139,11 @@ final class CredentialStore {
 final class AuthenticationService {
     private let session: URLSession
 
+    private struct LoginAttempt {
+        let result: LoginResult
+        let usedAutomaticCaptcha: Bool
+    }
+
     init() {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 8
@@ -154,28 +159,80 @@ final class AuthenticationService {
         logger: @escaping (String) -> Void
     ) async throws -> LoginResult {
         let base = normalizeBaseURL(settings.esurfingURL)
+        let firstAttempt = try await performLoginAttempt(
+            base: base,
+            request: request,
+            settings: settings,
+            captchaProvider: captchaProvider,
+            logger: logger,
+            allowAutomaticCaptcha: true
+        )
+
+        if firstAttempt.result.success {
+            return firstAttempt.result
+        }
+
+        if firstAttempt.usedAutomaticCaptcha && isCaptchaError(firstAttempt.result) {
+            logger("验证码自动识别错误，重新获取验证码，请手动输入")
+            let manualAttempt = try await performLoginAttempt(
+                base: base,
+                request: request,
+                settings: settings,
+                captchaProvider: captchaProvider,
+                logger: logger,
+                allowAutomaticCaptcha: false
+            )
+            return manualAttempt.result
+        }
+
+        return firstAttempt.result
+    }
+
+    private func performLoginAttempt(
+        base: String,
+        request: LoginRequest,
+        settings: AppSettings,
+        captchaProvider: (Data, String?) async -> String?,
+        logger: (String) -> Void,
+        allowAutomaticCaptcha: Bool
+    ) async throws -> LoginAttempt {
         let pageURL = try url("\(base)/qs/index_gz.jsp?wlanacip=\(settings.wlanACIP.urlFormEscaped)&wlanuserip=\(request.userIP.urlFormEscaped)")
         logger("获取广东天翼认证页面：\(pageURL.absoluteString)")
         let pageHTML = try await fetchText(pageURL)
         guard let captchaURL = extractCaptchaURL(from: pageHTML, pageURL: pageURL) else {
-            return LoginResult(success: false, message: "未找到验证码图片，请检查 ESurfing URL、WLAN AC IP 和本机 IP", signature: nil)
+            return LoginAttempt(
+                result: LoginResult(success: false, message: "未找到验证码图片，请检查 ESurfing URL、WLAN AC IP 和本机 IP", signature: nil),
+                usedAutomaticCaptcha: false
+            )
         }
 
         var captchaCode = ""
         logger("获取验证码")
         let imageData = try await fetchData(captchaURL)
         let recognition = CaptchaService.recognizeDetailed(imageData: imageData)
-        if let recognition, recognition.isReliable {
+        var usedAutomaticCaptcha = false
+        if allowAutomaticCaptcha, let recognition, recognition.isComplete {
             captchaCode = recognition.text
-            logger("验证码自动识别：\(captchaCode)")
-        } else if let manual = await captchaProvider(imageData, recognition?.text) {
+            usedAutomaticCaptcha = true
+            let confidenceLabel = recognition.isReliable ? "" : "，低置信度"
+            logger("验证码自动识别：\(captchaCode)\(confidenceLabel)")
+        } else if let manual = await captchaProvider(imageData, allowAutomaticCaptcha ? recognition?.text : nil) {
             if let recognition {
                 logger("验证码识别候选：\(recognition.text)，请确认")
             }
             captchaCode = sanitizeCaptcha(manual)
+            guard !captchaCode.isEmpty else {
+                return LoginAttempt(
+                    result: LoginResult(success: false, message: "验证码未填写", signature: nil),
+                    usedAutomaticCaptcha: false
+                )
+            }
             logger("使用手动验证码")
         } else {
-            return LoginResult(success: false, message: "验证码未填写", signature: nil)
+            return LoginAttempt(
+                result: LoginResult(success: false, message: "验证码未填写", signature: nil),
+                usedAutomaticCaptcha: false
+            )
         }
 
         let loginKey = try buildLoginKey(
@@ -201,7 +258,10 @@ final class AuthenticationService {
             ],
             headers: loginHeaders
         )
-        return classifyLoginResponse(response.text, cookies: response.cookies)
+        return LoginAttempt(
+            result: classifyLoginResponse(response.text, cookies: response.cookies),
+            usedAutomaticCaptcha: usedAutomaticCaptcha
+        )
     }
 
     func logout(settings: AppSettings, userIP: String, account: String, signature: String) async throws -> String {
@@ -320,6 +380,11 @@ final class AuthenticationService {
             return LoginResult(success: false, message: "网关返回空响应", signature: nil)
         }
         return LoginResult(success: false, message: response, signature: nil)
+    }
+
+    private func isCaptchaError(_ result: LoginResult) -> Bool {
+        guard !result.success else { return false }
+        return result.message.contains("验证码") || result.message.contains("11063000")
     }
 
     private func classifyLogoutResponse(_ response: String) throws -> String {

@@ -9,11 +9,14 @@ struct CaptchaRecognition {
     var isReliable: Bool {
         text.count == 4 && confidence >= 0.72
     }
+
+    var isComplete: Bool {
+        text.count == 4
+    }
 }
 
 final class CaptchaService {
     private static let allowedCharacters = CharacterSet.alphanumerics
-    private static let context = CIContext(options: [.useSoftwareRenderer: false])
 
     static func recognize(imageData: Data) -> String? {
         guard let result = recognizeDetailed(imageData: imageData), result.isReliable else {
