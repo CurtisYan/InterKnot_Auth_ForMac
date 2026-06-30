@@ -21,6 +21,12 @@ InterKnot Auth for macOS 是广东天翼校园网认证工具的 macOS 原生适
 - 全局可展开运行日志
 - 配置自动保存，密码可保存到 macOS Keychain
 
+## 界面预览
+
+<img src="img/1.png" width="75%" alt="InterKnot Auth for macOS 界面预览 1">
+
+<img src="img/2.png" width="75%" alt="InterKnot Auth for macOS 界面预览 2">
+
 ## 认证流程
 
 1. 填写账号、密码和认证参数。
