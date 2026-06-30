@@ -1,69 +1,135 @@
-import Foundation
 import CoreImage
+import Foundation
 import Vision
 
-// MARK: - Captcha Service
+struct CaptchaRecognition {
+    let text: String
+    let confidence: Float
+
+    var isReliable: Bool {
+        text.count == 4 && confidence >= 0.72
+    }
+}
 
 final class CaptchaService {
-    
-    /// Attempt automatic captcha recognition using Vision.
-    /// Returns the recognized text or nil if confidence is too low.
+    private static let allowedCharacters = CharacterSet.alphanumerics
+    private static let context = CIContext(options: [.useSoftwareRenderer: false])
+
     static func recognize(imageData: Data) -> String? {
+        guard let result = recognizeDetailed(imageData: imageData), result.isReliable else {
+            return nil
+        }
+        return result.text
+    }
+
+    static func recognizeDetailed(imageData: Data) -> CaptchaRecognition? {
         guard let ciImage = CIImage(data: imageData) else { return nil }
-        
-        // Preprocess
-        guard let processed = preprocessCaptchaImage(ciImage) else { return nil }
-        
-        // Use VNRecognizeTextRequest
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = false
-        request.customWords = ["0","1","2","3","4","5","6","7","8","9"]
-        
-        let handler = VNImageRequestHandler(ciImage: processed)
-        try? handler.perform([request])
-        
-        guard let results = request.results, !results.isEmpty else { return nil }
-        
-        // Find the best candidate (highest confidence, only digits)
-        var bestResult: String?
-        var bestConfidence: Float = 0
-        
-        for observation in results {
-            guard let candidate = observation.topCandidates(1).first else { continue }
-            let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
-            // Filter to only digits (typical Chinese campus captchas)
-            let digits = text.filter { $0.isNumber }
-            let confidence = candidate.confidence
-            
-            if confidence > bestConfidence, !digits.isEmpty {
-                bestResult = digits
-                bestConfidence = confidence
+
+        let variants = preprocessVariants(ciImage)
+        var best: CaptchaRecognition?
+
+        for variant in variants {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = false
+            request.minimumTextHeight = 0.18
+            request.recognitionLanguages = ["en-US"]
+
+            let handler = VNImageRequestHandler(ciImage: variant, options: [:])
+            do {
+                try handler.perform([request])
+            } catch {
+                Logger.write("[ERROR] Captcha OCR failed: \(error)")
+                continue
+            }
+
+            for observation in request.results ?? [] {
+                for candidate in observation.topCandidates(6) {
+                    guard let normalized = normalize(candidate.string) else { continue }
+                    let currentScore = score(text: normalized, confidence: candidate.confidence)
+                    if best == nil || currentScore > score(text: best!.text, confidence: best!.confidence) {
+                        best = CaptchaRecognition(text: normalized, confidence: candidate.confidence)
+                    }
+                }
             }
         }
-        
-        guard let result = bestResult, bestConfidence > 0.5 else { return nil }
-        Logger.write("Captcha auto-recognized: \(result) (confidence: \(bestConfidence))")
-        return result
+
+        if let best {
+            Logger.write("[INFO] Captcha OCR candidate: \(best.text) (\(best.confidence))")
+        }
+        return best
     }
-    
-    private static func preprocessCaptchaImage(_ input: CIImage) -> CIImage? {
-        // Step 1: Desaturate (grayscale)
-        let grayscale = input.applyingFilter("CIColorControls", parameters: [
-            kCIInputSaturationKey: 0.0,
+
+    private static func preprocessVariants(_ input: CIImage) -> [CIImage] {
+        let scaled = input.transformed(by: CGAffineTransform(scaleX: 4, y: 4))
+        let grayscale = scaled.applyingFilter("CIColorControls", parameters: [
+            kCIInputSaturationKey: 0,
+            kCIInputContrastKey: 1.6,
+            kCIInputBrightnessKey: 0.04
         ])
-        
-        // Step 2: Increase contrast
-        let contrasted = grayscale.applyingFilter("CIColorControls", parameters: [
-            kCIInputContrastKey: 2.0,
+        let strongContrast = grayscale.applyingFilter("CIColorControls", parameters: [
+            kCIInputSaturationKey: 0,
+            kCIInputContrastKey: 2.7,
+            kCIInputBrightnessKey: 0.08
         ])
-        
-        // Step 3: Apply threshold via color monochrome
-        let threshold = contrasted.applyingFilter("CIColorMonochrome", parameters: [
-            kCIInputColorKey: CIColor.black,
-            kCIInputIntensityKey: 1.0,
+        let sharpened = strongContrast.applyingFilter("CISharpenLuminance", parameters: [
+            kCIInputSharpnessKey: 0.6
         ])
-        
-        return threshold
+        let noisedDown = sharpened.applyingFilter("CIMedianFilter")
+
+        return [
+            scaled,
+            grayscale,
+            strongContrast,
+            sharpened,
+            noisedDown
+        ]
+    }
+
+    private static func normalize(_ raw: String) -> String? {
+        let mapped = raw
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "—", with: "")
+            .replacingOccurrences(of: "–", with: "")
+            .map { character -> Character? in
+                let scalarText = String(character)
+                if scalarText.rangeOfCharacter(from: allowedCharacters.inverted) == nil {
+                    return character
+                }
+                return nil
+            }
+            .compactMap { $0 }
+
+        let text = String(mapped).prefix(6)
+        guard text.count >= 3 else { return nil }
+        if text.count == 4 {
+            return String(text)
+        }
+        return bestFourCharacters(in: String(text))
+    }
+
+    private static func bestFourCharacters(in text: String) -> String? {
+        guard text.count > 4 else { return text.isEmpty ? nil : text }
+        let characters = Array(text)
+        let preferred = characters.filter { $0.isLetter || $0.isNumber }
+        guard preferred.count >= 4 else { return nil }
+        return String(preferred.prefix(4))
+    }
+
+    private static func score(text: String, confidence: Float) -> Float {
+        let lengthScore: Float
+        switch text.count {
+        case 4:
+            lengthScore = 0.35
+        case 3, 5:
+            lengthScore = 0.08
+        default:
+            lengthScore = -0.25
+        }
+        let diversityPenalty: Float = Set(text).count <= 2 ? 0.08 : 0
+        return confidence + lengthScore - diversityPenalty
     }
 }

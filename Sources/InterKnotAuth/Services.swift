@@ -150,7 +150,7 @@ final class AuthenticationService {
     func login(
         request: LoginRequest,
         settings: AppSettings,
-        captchaProvider: @escaping (Data) async -> String?,
+        captchaProvider: @escaping (Data, String?) async -> String?,
         logger: @escaping (String) -> Void
     ) async throws -> LoginResult {
         let base = normalizeBaseURL(settings.esurfingURL)
@@ -164,11 +164,15 @@ final class AuthenticationService {
         var captchaCode = ""
         logger("获取验证码")
         let imageData = try await fetchData(captchaURL)
-        if let recognized = CaptchaService.recognize(imageData: imageData), !recognized.isEmpty {
-            captchaCode = String(recognized.prefix(4))
+        let recognition = CaptchaService.recognizeDetailed(imageData: imageData)
+        if let recognition, recognition.isReliable {
+            captchaCode = recognition.text
             logger("验证码自动识别：\(captchaCode)")
-        } else if let manual = await captchaProvider(imageData) {
-            captchaCode = String(manual.prefix(4))
+        } else if let manual = await captchaProvider(imageData, recognition?.text) {
+            if let recognition {
+                logger("验证码识别候选：\(recognition.text)，请确认")
+            }
+            captchaCode = sanitizeCaptcha(manual)
             logger("使用手动验证码")
         } else {
             return LoginResult(success: false, message: "验证码未填写", signature: nil)
@@ -332,6 +336,14 @@ final class AuthenticationService {
             throw AppError.requestFailed("\(info)（\(code)）")
         }
         throw AppError.requestFailed(response)
+    }
+
+    private func sanitizeCaptcha(_ value: String) -> String {
+        value
+            .filter { $0.isLetter || $0.isNumber }
+            .prefix(4)
+            .map(String.init)
+            .joined()
     }
 
     private func extractCaptchaURL(from html: String, pageURL: URL) -> URL? {

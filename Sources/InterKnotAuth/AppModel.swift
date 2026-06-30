@@ -103,12 +103,13 @@ final class AppModel: ObservableObject {
                 let result = try await authenticator.login(
                     request: request,
                     settings: settings,
-                    captchaProvider: { [weak self] imageData in
+                    captchaProvider: { [weak self] imageData, suggestedCode in
                         await self?.requestCaptcha(
                             imageData: imageData,
                             title: "输入登录验证码",
                             submitTitle: "继续登录",
-                            generation: generation
+                            generation: generation,
+                            suggestedCode: suggestedCode
                         )
                     },
                     logger: { [weak self] message in
@@ -514,7 +515,13 @@ final class AppModel: ObservableObject {
         captchaInput = ""
     }
 
-    private func requestCaptcha(imageData: Data, title: String, submitTitle: String, generation: Int? = nil) async -> String? {
+    private func requestCaptcha(
+        imageData: Data,
+        title: String,
+        submitTitle: String,
+        generation: Int? = nil,
+        suggestedCode: String? = nil
+    ) async -> String? {
         if let generation, !isCurrentLogin(generation) {
             return nil
         }
@@ -526,7 +533,7 @@ final class AppModel: ObservableObject {
             captchaTitle = title
             captchaSubmitTitle = submitTitle
             captchaChallenge = CaptchaChallenge(imageData: imageData)
-            captchaInput = ""
+            captchaInput = suggestedCode ?? ""
         }
     }
 
@@ -540,11 +547,12 @@ final class AppModel: ObservableObject {
             let result = try await authenticator.login(
                 request: request,
                 settings: settings,
-                captchaProvider: { [weak self] imageData in
+                captchaProvider: { [weak self] imageData, suggestedCode in
                     await self?.requestCaptcha(
                         imageData: imageData,
                         title: "输入多拨验证码",
-                        submitTitle: "继续多拨"
+                        submitTitle: "继续多拨",
+                        suggestedCode: suggestedCode
                     )
                 },
                 logger: { [weak self] message in
