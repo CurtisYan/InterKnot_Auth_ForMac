@@ -123,8 +123,10 @@ private struct HeaderView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("InterKnot")
                     .font(.system(size: 24, weight: .semibold))
-                Text("绳网认证 for macOS")
+                Link("绳网认证 for macOS", destination: URL(string: "https://github.com/CurtisYan/InterKnot_Auth_ForMac")!)
                     .foregroundStyle(.secondary)
+                    .buttonStyle(.plain)
+                    .help("打开 GitHub 仓库")
             }
 
             Spacer()
