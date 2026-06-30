@@ -22,6 +22,8 @@
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSLocalNetworkUsageDescription</key>
     <string>InterKnot 需要访问本地网络以连接校园网认证网关、EasyTier 节点和本地 WebUI。</string>
     <key>NSAppTransportSecurity</key>
