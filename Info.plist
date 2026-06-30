@@ -15,6 +15,8 @@
     <key>CFBundleExecutable</key>
     <string>InterKnotAuth</string>
     <key>CFBundleIconFile</key>
+    <string>Icon.icns</string>
+    <key>CFBundleIconName</key>
     <string>Icon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>

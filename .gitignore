@@ -6,4 +6,5 @@ DerivedData/
 InterKnotAuth.app/
 InterKnotAuth.app alias
 Resources/Icon.iconset/
+release/
 .env
