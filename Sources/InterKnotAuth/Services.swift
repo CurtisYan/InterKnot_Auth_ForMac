@@ -552,6 +552,9 @@ final class WatchdogService {
     private let reconnect: () -> Void
     private let logger: (String) -> Void
     private var task: Task<Void, Never>?
+    private var checkCount = 0
+    private var lastReconnectAt: Date?
+    private var reconnectCooldown = 15
 
     init(
         timeout: Int,
@@ -560,7 +563,7 @@ final class WatchdogService {
         reconnect: @escaping () -> Void,
         logger: @escaping (String) -> Void
     ) {
-        self.timeout = max(timeout, 3)
+        self.timeout = max(timeout, 1)
         self.probeURLs = probeURLs
         self.hasLocalIP = hasLocalIP
         self.reconnect = reconnect
@@ -569,16 +572,11 @@ final class WatchdogService {
 
     func start() {
         task?.cancel()
-        task = Task {
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: UInt64(timeout) * 1_000_000_000)
-                guard hasLocalIP() else { continue }
-                let reachable = await anyProbeReachable()
-                if !reachable {
-                    logger("检测点全部不可达")
-                    reconnect()
-                }
-            }
+        checkCount = 0
+        lastReconnectAt = nil
+        reconnectCooldown = 15
+        task = Task { [weak self] in
+            await self?.runLoop()
         }
     }
 
@@ -587,19 +585,64 @@ final class WatchdogService {
         task = nil
     }
 
+    private func runLoop() async {
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard hasLocalIP() else { continue }
+
+            checkCount += 1
+            guard checkCount % timeout == 0 else { continue }
+
+            let reachable = await anyProbeReachable()
+            if !reachable {
+                logger("检测点全部不可达")
+                tryReconnect()
+            }
+        }
+    }
+
+    private func tryReconnect() {
+        let now = Date()
+        if let lastReconnectAt,
+           now.timeIntervalSince(lastReconnectAt) < TimeInterval(reconnectCooldown) {
+            return
+        }
+
+        lastReconnectAt = now
+        reconnect()
+        reconnectCooldown = min(reconnectCooldown + 30, 600)
+    }
+
     private func anyProbeReachable() async -> Bool {
         for item in probeURLs {
-            guard let url = URL(string: item) else { continue }
+            let normalized = item.hasPrefix("http://") || item.hasPrefix("https://")
+                ? item
+                : "https://\(item)"
+            guard let url = URL(string: normalized) else { continue }
+            let probe = watchdogProbe(for: normalized)
             var request = URLRequest(url: url)
-            request.httpMethod = "HEAD"
-            request.timeoutInterval = 3
+            request.httpMethod = probe.method
+            request.timeoutInterval = 4
             if let (_, response) = try? await URLSession.shared.data(for: request),
                let code = (response as? HTTPURLResponse)?.statusCode,
-               (200..<500).contains(code) {
+               ![301, 302, 303, 307, 308].contains(code),
+               probe.isExpectedStatus(code) {
+                reconnectCooldown = 15
                 return true
             }
         }
         return false
+    }
+
+    private func watchdogProbe(for url: String) -> (method: String, isExpectedStatus: (Int) -> Bool) {
+        if url.contains("generate_204") {
+            return ("GET", { $0 == 204 })
+        }
+        if url.contains("msftconnecttest.com/connecttest.txt")
+            || url.contains("captive.apple.com/hotspot-detect.html") {
+            return ("HEAD", { $0 == 200 })
+        }
+        return ("HEAD", { (200..<500).contains($0) })
     }
 }
 

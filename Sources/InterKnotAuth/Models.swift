@@ -93,6 +93,15 @@ struct EasyTierSettings: Codable, Equatable {
 }
 
 struct AppSettings: Codable, Equatable {
+    static let defaultProbeURLs: [String] = [
+        "http://www.msftconnecttest.com/connecttest.txt",
+        "http://connectivitycheck.gstatic.com/generate_204",
+        "http://www.google.cn/generate_204",
+        "http://captive.apple.com/hotspot-detect.html",
+        "http://connect.rom.miui.com/generate_204",
+        "http://wifi.vivo.com.cn/generate_204"
+    ]
+
     var username: String = ""
     var savePassword: Bool = true
     var autoConnect: Bool = false
@@ -106,11 +115,7 @@ struct AppSettings: Codable, Equatable {
     var wlanACIP: String = "0.0.0.0"
     var wlanUserIP: String = "0.0.0.0"
     var watchdogTimeout: Int = 5
-    var probeURLs: [String] = [
-        "https://www.apple.com/library/test/success.html",
-        "https://www.baidu.com",
-        "https://www.qq.com"
-    ]
+    var probeURLs: [String] = AppSettings.defaultProbeURLs
 
     var rsaPublicKey: String = AppSettings.defaultRSAPublicKey
     var multiAccounts: [MultiLoginAccount] = []
@@ -153,11 +158,7 @@ struct AppSettings: Codable, Equatable {
         wlanACIP = try container.decodeIfPresent(String.self, forKey: .wlanACIP) ?? "0.0.0.0"
         wlanUserIP = try container.decodeIfPresent(String.self, forKey: .wlanUserIP) ?? "0.0.0.0"
         watchdogTimeout = try container.decodeIfPresent(Int.self, forKey: .watchdogTimeout) ?? 5
-        probeURLs = try container.decodeIfPresent([String].self, forKey: .probeURLs) ?? [
-            "https://www.apple.com/library/test/success.html",
-            "https://www.baidu.com",
-            "https://www.qq.com"
-        ]
+        probeURLs = try container.decodeIfPresent([String].self, forKey: .probeURLs) ?? AppSettings.defaultProbeURLs
         rsaPublicKey = try container.decodeIfPresent(String.self, forKey: .rsaPublicKey) ?? AppSettings.defaultRSAPublicKey
         multiAccounts = try container.decodeIfPresent([MultiLoginAccount].self, forKey: .multiAccounts) ?? []
         easyTier = try container.decodeIfPresent(EasyTierSettings.self, forKey: .easyTier) ?? EasyTierSettings()

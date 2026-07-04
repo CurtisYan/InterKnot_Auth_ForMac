@@ -71,9 +71,13 @@ final class AppModel: ObservableObject {
         password = credentialStore.password(for: settings.username) ?? ""
     }
 
-    func login(account: MultiLoginAccount? = nil) {
+    func login(account: MultiLoginAccount? = nil, force: Bool = false) {
         guard !isLogoutInProgress else {
             log("正在注销，已忽略登录请求")
+            return
+        }
+        if case .loggingIn = connectionState {
+            log("正在登录，已忽略重复登录请求")
             return
         }
         loginTask?.cancel()
@@ -124,7 +128,9 @@ final class AppModel: ObservableObject {
                     guard self.isCurrentLogin(generation) else { return }
                     if result.success {
                         self.connectionState = .connected(result.message)
-                        self.lastSignature = result.signature ?? ""
+                        if let signature = result.signature, !signature.isEmpty {
+                            self.lastSignature = signature
+                        }
                         if self.settings.savePassword {
                             self.credentialStore.save(password: self.password, for: request.username)
                         }
@@ -305,7 +311,7 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in
                     guard let self, !self.isLogoutInProgress, self.connectionState != .loggingOut else { return }
                     self.log("看门狗触发重连")
-                    self.login()
+                    self.login(force: true)
                 }
             },
             logger: { [weak self] message in
