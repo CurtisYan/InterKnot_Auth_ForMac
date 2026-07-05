@@ -204,7 +204,7 @@ final class AuthenticationService {
         let pageHTML = try await fetchText(pageURL)
         guard let captchaURL = extractCaptchaURL(from: pageHTML, pageURL: pageURL) else {
             return LoginAttempt(
-                result: LoginResult(success: false, message: "未找到验证码图片，请检查 ESurfing URL、WLAN AC IP 和本机 IP", signature: nil),
+                result: LoginResult(success: false, message: "未找到验证码图片，请检查 ESurfing URL、WLAN AC IP 和认证 IP", signature: nil),
                 usedAutomaticCaptcha: false
             )
         }
@@ -284,14 +284,15 @@ final class AuthenticationService {
     }
 
     func detectParameters() async throws -> CampusParameters {
-        let target = try url("http://189.cn/")
-        var request = URLRequest(url: target)
-        request.timeoutInterval = 3
-        let (_, response) = try await session.data(for: request)
-        guard let finalURL = (response as? HTTPURLResponse)?.url?.absoluteString else {
-            throw AppError.requestFailed("没有收到广东天翼重定向 URL")
+        var errors: [String] = []
+        for target in ["http://189.cn/", "http://connect.rom.miui.com/generate_204"] {
+            do {
+                return try await detectParameters(from: target)
+            } catch {
+                errors.append(error.localizedDescription)
+            }
         }
-        return try parseParameters(from: finalURL)
+        throw AppError.requestFailed(errors.last ?? "没有收到广东天翼重定向 URL")
     }
 
     func parseParameters(from redirectURL: String) throws -> CampusParameters {
@@ -351,6 +352,35 @@ final class AuthenticationService {
         let cookies = (response as? HTTPURLResponse)
             .flatMap { HTTPCookie.cookies(withResponseHeaderFields: $0.allHeaderFields as? [String: String] ?? [:], for: url) } ?? []
         return (text, cookies)
+    }
+
+    private func detectParameters(from target: String) async throws -> CampusParameters {
+        let targetURL = try url(target)
+        var request = URLRequest(url: targetURL)
+        request.timeoutInterval = 4
+        request.setValue("CCTP/android64_vpn/2093", forHTTPHeaderField: "User-Agent")
+        request.setValue("text/html,text/xml,application/xhtml+xml,application/x-javascript,*/*", forHTTPHeaderField: "Accept")
+        let (data, response) = try await session.data(for: request)
+
+        if let finalURL = (response as? HTTPURLResponse)?.url?.absoluteString,
+           finalURL != target,
+           let params = try? parseParameters(from: finalURL) {
+            return params
+        }
+
+        let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .gb18030) ?? ""
+        if let params = try? parsePortalConfig(from: text) {
+            return params
+        }
+
+        throw AppError.requestFailed("没有收到广东天翼重定向 URL")
+    }
+
+    private func parsePortalConfig(from text: String) throws -> CampusParameters {
+        guard let ticketURL = firstCapture(pattern: #"<ticket-url>\s*([^<]+)\s*</ticket-url>"#, in: text) else {
+            throw AppError.requestFailed("未找到客户端认证配置")
+        }
+        return try parseParameters(from: ticketURL)
     }
 
     private func buildLoginKey(
@@ -549,35 +579,34 @@ final class ConnectivityProbeService {
 }
 
 final class WatchdogService {
-    private let timeout: Int
+    private static let intervalSeconds = 15
     private let probeURLs: [String]
     private let hasLocalIP: () -> Bool
+    private let shouldReconnect: () async -> Bool
     private let reconnect: () -> Void
     private let logger: (String) -> Void
     private var task: Task<Void, Never>?
-    private var checkCount = 0
     private var lastReconnectAt: Date?
     private var reconnectCooldown = 15
 
     init(
-        timeout: Int,
         probeURLs: [String],
         hasLocalIP: @escaping () -> Bool,
+        shouldReconnect: @escaping () async -> Bool,
         reconnect: @escaping () -> Void,
         logger: @escaping (String) -> Void
     ) {
-        self.timeout = max(timeout, 1)
         self.probeURLs = probeURLs
         self.hasLocalIP = hasLocalIP
+        self.shouldReconnect = shouldReconnect
         self.reconnect = reconnect
         self.logger = logger
     }
 
     func start() {
         task?.cancel()
-        checkCount = 0
         lastReconnectAt = nil
-        reconnectCooldown = 15
+        reconnectCooldown = Self.intervalSeconds
         task = Task { [weak self] in
             await self?.runLoop()
         }
@@ -590,11 +619,14 @@ final class WatchdogService {
 
     private func runLoop() async {
         while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(Self.intervalSeconds) * 1_000_000_000)
             guard hasLocalIP() else { continue }
 
-            checkCount += 1
-            guard checkCount % timeout == 0 else { continue }
+            if await shouldReconnect() {
+                logger("看门狗检测到认证请求失败，准备重连")
+                tryReconnect()
+                continue
+            }
 
             let reachable = await anyProbeReachable()
             if !reachable {
@@ -630,7 +662,7 @@ final class WatchdogService {
                let code = (response as? HTTPURLResponse)?.statusCode,
                ![301, 302, 303, 307, 308].contains(code),
                probe.isExpectedStatus(code) {
-                reconnectCooldown = 15
+                reconnectCooldown = Self.intervalSeconds
                 return true
             }
         }
@@ -708,22 +740,25 @@ final class EasyTierService {
 final class LocalWebServer {
     private var listener: NWListener?
 
-    func start(port: UInt16, htmlProvider: @escaping () -> String) throws {
+    func start(
+        port: UInt16,
+        htmlProvider: @escaping () -> String,
+        downloadEnabledProvider: @escaping () -> Bool
+    ) throws {
         stop()
         let listener = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: port)!)
         listener.newConnectionHandler = { connection in
             connection.start(queue: .global(qos: .utility))
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { _, _, _, _ in
-                let body = htmlProvider()
-                let response = """
-                HTTP/1.1 200 OK\r
-                Content-Type: text/html; charset=utf-8\r
-                Content-Length: \(body.data(using: .utf8)?.count ?? 0)\r
-                Connection: close\r
-                \r
-                \(body)
-                """
-                connection.send(content: response.data(using: .utf8), completion: .contentProcessed { _ in
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, _, _ in
+                let path = Self.requestPath(from: data) ?? "/"
+                let isLocal = Self.isLocalClient(connection.endpoint)
+                let response = Self.response(
+                    path: path,
+                    isLocal: isLocal,
+                    htmlProvider: htmlProvider,
+                    downloadEnabledProvider: downloadEnabledProvider
+                )
+                connection.send(content: response, completion: .contentProcessed { _ in
                     connection.cancel()
                 })
             }
@@ -735,6 +770,170 @@ final class LocalWebServer {
     func stop() {
         listener?.cancel()
         listener = nil
+    }
+
+    private static func requestPath(from data: Data?) -> String? {
+        guard let data,
+              let text = String(data: data, encoding: .utf8),
+              let firstLine = text.split(separator: "\r\n", maxSplits: 1).first else {
+            return nil
+        }
+        let parts = firstLine.split(separator: " ")
+        guard parts.count >= 2 else { return nil }
+        let rawPath = String(parts[1])
+        return URLComponents(string: rawPath)?.path ?? rawPath
+    }
+
+    private static func isLocalClient(_ endpoint: NWEndpoint) -> Bool {
+        guard case .hostPort(let host, _) = endpoint else { return false }
+        let value = "\(host)".lowercased()
+        return value == "localhost"
+            || value == "127.0.0.1"
+            || value == "::1"
+            || value.hasPrefix("::ffff:127.")
+    }
+
+    private static func response(
+        path: String,
+        isLocal: Bool,
+        htmlProvider: () -> String,
+        downloadEnabledProvider: () -> Bool
+    ) -> Data {
+        switch path {
+        case "/":
+            if isLocal {
+                return htmlResponse(htmlProvider())
+            }
+            return redirectResponse(to: "/download")
+        case "/download":
+            guard downloadEnabledProvider() else {
+                return textResponse("Download service is disabled.", status: 403)
+            }
+            return htmlResponse(downloadHTML())
+        case "/download/InterKnot":
+            guard downloadEnabledProvider() else {
+                return textResponse("This page is not accessible.", status: 403)
+            }
+            do {
+                let archiveURL = try applicationArchiveURL()
+                let data = try Data(contentsOf: archiveURL)
+                return rawResponse(
+                    data,
+                    status: 200,
+                    contentType: "application/zip",
+                    extraHeaders: [
+                        "Content-Disposition": "attachment; filename=\"InterKnotAuth_ForMac.zip\""
+                    ]
+                )
+            } catch {
+                return textResponse("Download package is unavailable: \(error.localizedDescription)", status: 404)
+            }
+        default:
+            return textResponse("Not Found", status: 404)
+        }
+    }
+
+    private static func htmlResponse(_ html: String, status: Int = 200) -> Data {
+        rawResponse(Data(html.utf8), status: status, contentType: "text/html; charset=utf-8")
+    }
+
+    private static func textResponse(_ text: String, status: Int) -> Data {
+        rawResponse(Data(text.utf8), status: status, contentType: "text/plain; charset=utf-8")
+    }
+
+    private static func redirectResponse(to location: String) -> Data {
+        rawResponse(Data(), status: 302, contentType: "text/plain; charset=utf-8", extraHeaders: ["Location": location])
+    }
+
+    private static func rawResponse(
+        _ body: Data,
+        status: Int,
+        contentType: String,
+        extraHeaders: [String: String] = [:]
+    ) -> Data {
+        var headers = [
+            "HTTP/1.1 \(status) \(statusReason(status))",
+            "Content-Type: \(contentType)",
+            "Content-Length: \(body.count)",
+            "Connection: close"
+        ]
+        headers.append(contentsOf: extraHeaders.map { "\($0.key): \($0.value)" })
+        var response = Data(headers.joined(separator: "\r\n").utf8)
+        response.append(Data("\r\n\r\n".utf8))
+        response.append(body)
+        return response
+    }
+
+    private static func statusReason(_ status: Int) -> String {
+        switch status {
+        case 200: return "OK"
+        case 302: return "Found"
+        case 403: return "Forbidden"
+        case 404: return "Not Found"
+        default: return "OK"
+        }
+    }
+
+    private static func downloadHTML() -> String {
+        """
+        <!doctype html>
+        <html lang="zh-CN">
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>下载 InterKnot</title>
+        <style>
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f6f8;color:#1f2328}
+        main{width:min(520px,calc(100vw - 40px));background:white;border:1px solid #d8dee4;border-radius:8px;padding:28px;box-shadow:0 12px 28px rgba(31,35,40,.08)}
+        h1{font-size:26px;margin:0 0 10px}
+        p{line-height:1.55;color:#59636e;margin:0 0 22px}
+        a{display:inline-flex;align-items:center;justify-content:center;height:40px;padding:0 18px;border-radius:6px;background:#0969da;color:white;text-decoration:none;font-weight:600}
+        </style>
+        </head>
+        <body>
+        <main>
+        <h1>InterKnot for macOS</h1>
+        <p>此页面由局域网内的绳网 WebUI 提供，用于从当前设备下载 InterKnot 应用包。</p>
+        <a href="/download/InterKnot">下载应用</a>
+        </main>
+        </body>
+        </html>
+        """
+    }
+
+    private static func applicationArchiveURL() throws -> URL {
+        let bundleURL = Bundle.main.bundleURL
+        guard bundleURL.pathExtension == "app" else {
+            throw AppError.requestFailed("当前运行目标不是 macOS App Bundle")
+        }
+
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0"
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("InterKnotAuthWebDownload", isDirectory: true)
+        let archiveURL = cacheDirectory.appendingPathComponent("InterKnotAuth_ForMac_\(version)_\(build).zip")
+        if FileManager.default.fileExists(atPath: archiveURL.path) {
+            return archiveURL
+        }
+
+        try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = [
+            "-c",
+            "-k",
+            "--sequesterRsrc",
+            "--keepParent",
+            bundleURL.path,
+            archiveURL.path
+        ]
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              FileManager.default.fileExists(atPath: archiveURL.path) else {
+            throw AppError.requestFailed("应用包打包失败")
+        }
+        return archiveURL
     }
 }
 

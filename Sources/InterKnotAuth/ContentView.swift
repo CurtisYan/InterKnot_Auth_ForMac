@@ -240,7 +240,7 @@ private struct DashboardView: View {
                             FieldSummary("网关", value: model.settings.esurfingURL)
                         }
                         GridRow {
-                            FieldSummary("本机 IP", value: model.settings.wlanUserIP)
+                            FieldSummary("认证 IP", value: model.settings.wlanUserIP)
                             FieldSummary("AC IP", value: model.settings.wlanACIP)
                         }
                         GridRow {
@@ -326,16 +326,7 @@ private struct SettingsView: View {
 
             Section("后台运行") {
                 Toggle("登录后开启看门狗", isOn: $model.settings.enableWatchdog)
-                HStack {
-                    Text("看门狗间隔")
-                        .frame(width: 110, alignment: .leading)
-                    TextField("秒", value: $model.settings.watchdogTimeout, format: .number)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 90)
-                    Text("秒")
-                        .foregroundStyle(.secondary)
-                }
-                Toggle("自动更新本机 IP", isOn: $model.settings.autoUpdateUserIP)
+                Toggle("自动更新认证 IP", isOn: $model.settings.autoUpdateUserIP)
             }
 
             Section("网络共享") {
@@ -371,8 +362,8 @@ private struct NetworkSettingsView: View {
                 )
                 HStack {
                     RequiredTextField(
-                        "本机登录 IP",
-                        label: "本机登录 IP",
+                        "校园网认证 IP",
+                        label: "认证 IP",
                         text: $model.settings.wlanUserIP,
                         isMissing: model.missingFields.contains(.wlanUserIP)
                     )

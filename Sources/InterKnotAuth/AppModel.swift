@@ -6,6 +6,9 @@ import SwiftUI
 
 @MainActor
 final class AppModel: ObservableObject {
+    private static let maxLogEntries = 400
+    private static let logTrimThreshold = 500
+
     @Published var settings: AppSettings
     @Published var password: String = ""
     @Published var selectedSection: AppSection = .dashboard
@@ -41,6 +44,7 @@ final class AppModel: ObservableObject {
     private var probeGeneration = 0
     private var isLogoutInProgress = false
     private var isApplyingLaunchAtLogin = false
+    private var retryFailedLoginWithWatchdog = false
 
     init() {
         var loaded = configStore.load()
@@ -83,9 +87,12 @@ final class AppModel: ObservableObject {
             log("正在注销，已忽略登录请求")
             return
         }
-        if case .loggingIn = connectionState {
+        if case .loggingIn = connectionState, !force {
             log("正在登录，已忽略重复登录请求")
             return
+        }
+        if case .loggingIn = connectionState, force {
+            log("强制重连：取消当前认证请求")
         }
         loginTask?.cancel()
         cancelPendingCaptcha()
@@ -101,10 +108,13 @@ final class AppModel: ObservableObject {
             mode: settings.loginMode
         )
 
-        guard validateBeforeLogin(request: request) else {
+        let shouldRefreshUserIP = account == nil && settings.autoUpdateUserIP
+        guard validateBeforeLogin(request: request, allowRefreshParameters: shouldRefreshUserIP) else {
             return
         }
 
+        let wasWatchdogRunning = watchdog != nil
+        retryFailedLoginWithWatchdog = false
         stopWatchdog()
         connectionState = .loggingIn
         log("开始认证：\(request.username)，IP：\(request.userIP)")
@@ -112,8 +122,9 @@ final class AppModel: ObservableObject {
         loginTask = Task { [weak self] in
             guard let self else { return }
             do {
+                let preparedRequest = try await self.prepareLoginRequest(request, refreshUserIP: shouldRefreshUserIP)
                 let result = try await authenticator.login(
-                    request: request,
+                    request: preparedRequest,
                     settings: settings,
                     captchaProvider: { [weak self] imageData, suggestedCode in
                         await self?.requestCaptcha(
@@ -140,16 +151,19 @@ final class AppModel: ObservableObject {
                             self.lastSignature = signature
                         }
                         if self.settings.savePassword {
-                            self.credentialStore.save(password: self.password, for: request.username)
+                            self.credentialStore.save(password: self.password, for: preparedRequest.username)
+                        } else {
+                            self.credentialStore.delete(account: preparedRequest.username)
                         }
-                        self.settings.username = request.username
-                        self.rememberAccount(request.username)
+                        self.settings.username = preparedRequest.username
+                        self.rememberAccount(preparedRequest.username)
                         self.configStore.save(self.settings)
                         self.log("登录成功")
                         self.startWatchdogIfNeeded()
                         self.scheduleConnectivityCheck(generation: generation)
                     } else {
                         self.fail(result.message)
+                        self.restoreWatchdogAfterLoginFailure(wasRunning: wasWatchdogRunning)
                     }
                 }
             } catch is CancellationError {
@@ -161,6 +175,8 @@ final class AppModel: ObservableObject {
                 await MainActor.run {
                     guard self.isCurrentLogin(generation) else { return }
                     self.fail(error.localizedDescription)
+                    let shouldRetry = self.isRetryableLoginTransportError(error)
+                    self.restoreWatchdogAfterLoginFailure(wasRunning: wasWatchdogRunning, retryLogin: shouldRetry)
                 }
             }
         }
@@ -173,6 +189,7 @@ final class AppModel: ObservableObject {
         loginTask?.cancel()
         cancelPendingCaptcha()
         isProbing = false
+        retryFailedLoginWithWatchdog = false
         stopWatchdog()
         guard !lastSignature.isEmpty else {
             log("您尚未登录，无需下线！")
@@ -313,9 +330,16 @@ final class AppModel: ObservableObject {
         guard settings.enableWatchdog else { return }
         watchdog?.stop()
         let service = WatchdogService(
-            timeout: settings.watchdogTimeout,
             probeURLs: settings.probeURLs,
             hasLocalIP: { NetworkInterfaceService.localIPv4Address() != nil },
+            shouldReconnect: { [weak self] in
+                await MainActor.run {
+                    guard let self, !self.isLogoutInProgress, self.connectionState != .loggingOut else {
+                        return false
+                    }
+                    return self.retryFailedLoginWithWatchdog
+                }
+            },
             reconnect: { [weak self] in
                 Task { @MainActor in
                     guard let self, !self.isLogoutInProgress, self.connectionState != .loggingOut else { return }
@@ -392,8 +416,8 @@ final class AppModel: ObservableObject {
 
     func log(_ message: String, level: String = "INFO") {
         logs.append(LogEntry(level: level, message: message))
-        if logs.count > 1000 {
-            logs.removeFirst(logs.count - 1000)
+        if logs.count > Self.logTrimThreshold {
+            logs.removeFirst(logs.count - Self.maxLogEntries)
         }
         Logger.write("[\(level)] \(message)")
     }
@@ -421,20 +445,10 @@ final class AppModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        $password
-            .dropFirst()
-            .debounce(for: .milliseconds(600), scheduler: RunLoop.main)
-            .sink { [weak self] password in
-                Task { @MainActor in
-                    self?.persistPassword(password)
-                }
-            }
-            .store(in: &cancellables)
     }
 
     private func persistSettings(_ settings: AppSettings) {
         configStore.save(settings)
-        persistPassword(password)
     }
 
     private func rememberAccount(_ account: String) {
@@ -463,14 +477,6 @@ final class AppModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             guard self.isCurrentLogin(generation) else { return }
             self.checkConnectivity()
-        }
-    }
-
-    private func persistPassword(_ password: String) {
-        if settings.savePassword, !settings.username.isEmpty, !password.isEmpty {
-            credentialStore.save(password: password, for: settings.username)
-        } else if !settings.savePassword, !settings.username.isEmpty {
-            credentialStore.delete(account: settings.username)
         }
     }
 
@@ -516,7 +522,7 @@ final class AppModel: ObservableObject {
         return NetworkInterfaceService.localIPv4Address() ?? "0.0.0.0"
     }
 
-    private func validateBeforeLogin(request: LoginRequest) -> Bool {
+    private func validateBeforeLogin(request: LoginRequest, allowRefreshParameters: Bool = false) -> Bool {
         var missing: Set<RequiredField> = []
         if request.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             missing.insert(.username)
@@ -527,13 +533,14 @@ final class AppModel: ObservableObject {
         if request.password.isEmpty {
             missing.insert(.password)
         }
-        if settings.esurfingURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !allowRefreshParameters, settings.esurfingURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             missing.insert(.esurfingURL)
         }
-        if settings.wlanACIP.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || settings.wlanACIP == "0.0.0.0" {
+        if !allowRefreshParameters,
+           settings.wlanACIP.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || settings.wlanACIP == "0.0.0.0" {
             missing.insert(.wlanACIP)
         }
-        if request.userIP.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || request.userIP == "0.0.0.0" {
+        if !allowRefreshParameters && !isUsableLoginIP(request.userIP) {
             missing.insert(.wlanUserIP)
         }
 
@@ -553,6 +560,37 @@ final class AppModel: ObservableObject {
             return false
         }
         return true
+    }
+
+    private func prepareLoginRequest(_ request: LoginRequest, refreshUserIP: Bool) async throws -> LoginRequest {
+        guard refreshUserIP else { return request }
+
+        log("自动更新认证 IP：尝试从校园网重定向获取")
+        var prepared = request
+        do {
+            let params = try await authenticator.detectParameters()
+            settings.esurfingURL = params.esurfingURL
+            settings.wlanACIP = params.wlanACIP
+            settings.wlanUserIP = params.wlanUserIP
+            missingFields.subtract([.esurfingURL, .wlanACIP, .wlanUserIP])
+            prepared.userIP = params.wlanUserIP
+            log("自动更新认证 IP 成功：\(params.wlanUserIP)")
+        } catch {
+            log("自动更新认证 IP 失败：\(error.localizedDescription)，继续使用当前配置", level: "ERROR")
+        }
+
+        guard !settings.esurfingURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !settings.wlanACIP.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              settings.wlanACIP != "0.0.0.0",
+              isUsableLoginIP(prepared.userIP) else {
+            throw AppError.requestFailed("自动更新认证参数失败，且当前认证参数不完整")
+        }
+        return prepared
+    }
+
+    private func isUsableLoginIP(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && trimmed != "0.0.0.0"
     }
 
     private func isCurrentLogin(_ generation: Int) -> Bool {
@@ -626,9 +664,15 @@ final class AppModel: ObservableObject {
 
     private func startWebUI() {
         do {
-            try webUI.start(port: 50000) { [weak self] in
-                self?.currentStatusHTML() ?? ""
-            }
+            try webUI.start(
+                port: 50000,
+                htmlProvider: { [weak self] in
+                    self?.currentStatusHTML() ?? ""
+                },
+                downloadEnabledProvider: { [weak self] in
+                    self?.settings.easyTier.enableWebDownload ?? false
+                }
+            )
             webUIState = "http://localhost:50000"
             log("WebUI 已启动：http://localhost:50000")
         } catch {
@@ -654,5 +698,36 @@ final class AppModel: ObservableObject {
     private func fail(_ message: String) {
         connectionState = .failed(message)
         log(message, level: "ERROR")
+    }
+
+    private func restoreWatchdogAfterLoginFailure(wasRunning: Bool, retryLogin: Bool = false) {
+        guard settings.enableWatchdog, wasRunning || retryLogin else { return }
+        retryFailedLoginWithWatchdog = retryLogin
+        if retryLogin {
+            log("认证请求失败，将由看门狗继续重试")
+        }
+        startWatchdogIfNeeded()
+    }
+
+    private func isRetryableLoginTransportError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        guard nsError.domain == NSURLErrorDomain else {
+            return false
+        }
+        let code = URLError.Code(rawValue: nsError.code)
+
+        switch code {
+        case .notConnectedToInternet,
+             .networkConnectionLost,
+             .timedOut,
+             .cannotFindHost,
+             .cannotConnectToHost,
+             .dnsLookupFailed,
+             .secureConnectionFailed,
+             .cannotLoadFromNetwork:
+            return true
+        default:
+            return false
+        }
     }
 }

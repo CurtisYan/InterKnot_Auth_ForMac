@@ -24,7 +24,7 @@ enum RequiredField: Hashable {
         case .password: return "密码"
         case .esurfingURL: return "ESurfing URL"
         case .wlanACIP: return "WLAN AC IP"
-        case .wlanUserIP: return "本机 IP"
+        case .wlanUserIP: return "认证 IP"
         }
     }
 }
@@ -157,10 +157,11 @@ struct AppSettings: Codable, Equatable {
         autoShare = try container.decodeIfPresent(Bool.self, forKey: .autoShare) ?? false
         autoUpdateUserIP = try container.decodeIfPresent(Bool.self, forKey: .autoUpdateUserIP) ?? false
         loginMode = try container.decodeIfPresent(LoginMode.self, forKey: .loginMode) ?? .automatic
+        let legacyWatchdogTimeout = try container.decodeIfPresent(Int.self, forKey: .watchdogTimeout) ?? 5
         esurfingURL = try container.decodeIfPresent(String.self, forKey: .esurfingURL) ?? "enet.10000.gd.cn:10001"
         wlanACIP = try container.decodeIfPresent(String.self, forKey: .wlanACIP) ?? "0.0.0.0"
         wlanUserIP = try container.decodeIfPresent(String.self, forKey: .wlanUserIP) ?? "0.0.0.0"
-        watchdogTimeout = try container.decodeIfPresent(Int.self, forKey: .watchdogTimeout) ?? 5
+        watchdogTimeout = legacyWatchdogTimeout
         probeURLs = try container.decodeIfPresent([String].self, forKey: .probeURLs) ?? AppSettings.defaultProbeURLs
         rsaPublicKey = try container.decodeIfPresent(String.self, forKey: .rsaPublicKey) ?? AppSettings.defaultRSAPublicKey
         multiAccounts = try container.decodeIfPresent([MultiLoginAccount].self, forKey: .multiAccounts) ?? []

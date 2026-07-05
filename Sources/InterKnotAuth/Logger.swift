@@ -4,6 +4,10 @@ import Foundation
 
 final class Logger {
     private static let queue = DispatchQueue(label: "com.interknot.logger")
+    private static let maxLogBytes = 512 * 1024
+    private static let trimToBytes = 384 * 1024
+    private static let trimCheckInterval = 64
+    private static var writesSinceTrim = 0
     private static let logURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("InterKnotAuth", isDirectory: true)
         .appendingPathComponent("log.txt")
@@ -27,10 +31,36 @@ final class Logger {
             } else {
                 try? line.write(to: logURL, atomically: true, encoding: .utf8)
             }
+
+            writesSinceTrim += 1
+            if writesSinceTrim >= trimCheckInterval {
+                writesSinceTrim = 0
+                trimIfNeeded()
+            }
         }
     }
     
     static func clear() {
-        try? "".write(to: logURL, atomically: true, encoding: .utf8)
+        queue.async {
+            try? "".write(to: logURL, atomically: true, encoding: .utf8)
+            writesSinceTrim = 0
+        }
+    }
+
+    private static func trimIfNeeded() {
+        guard let size = (try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size]) as? NSNumber,
+              size.intValue > maxLogBytes,
+              let data = try? Data(contentsOf: logURL) else {
+            return
+        }
+
+        let suffix = data.suffix(trimToBytes)
+        let trimmed: Data
+        if let newlineIndex = suffix.firstIndex(of: UInt8(ascii: "\n")) {
+            trimmed = Data(suffix[suffix.index(after: newlineIndex)...])
+        } else {
+            trimmed = Data(suffix)
+        }
+        try? trimmed.write(to: logURL, options: .atomic)
     }
 }

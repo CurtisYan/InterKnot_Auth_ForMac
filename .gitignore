@@ -7,4 +7,5 @@ InterKnotAuth.app/
 InterKnotAuth.app alias
 Resources/Icon.iconset/
 release/
+InterKnotAuth_ForMac*.zip
 .env
