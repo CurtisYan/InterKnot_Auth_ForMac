@@ -112,14 +112,15 @@ final class AppModel: ObservableObject {
 
         let willUseStudentDialer = shouldUseStudentDialer(for: request)
         let shouldRefreshUserIP = account == nil && settings.autoUpdateUserIP && !willUseStudentDialer
+        let wasWatchdogRunning = watchdog != nil
+        retryFailedLoginWithWatchdog = false
+        stopWatchdog()
         guard validateBeforeLogin(request: request, allowRefreshParameters: shouldRefreshUserIP || willUseStudentDialer) else {
             return
         }
 
-        let wasWatchdogRunning = watchdog != nil
-        retryFailedLoginWithWatchdog = false
-        stopWatchdog()
         connectionState = .loggingIn
+        logLoginRoute(request, usesStudentDialer: willUseStudentDialer)
         log("开始认证：\(request.username)，IP：\(request.userIP)")
 
         loginTask = Task { [weak self] in
@@ -633,6 +634,16 @@ final class AppModel: ObservableObject {
 
     private func shouldUseStudentDialer(for request: LoginRequest) -> Bool {
         request.mode == .automatic && !request.username.lowercased().hasPrefix("t")
+    }
+
+    private func logLoginRoute(_ request: LoginRequest, usesStudentDialer: Bool) {
+        if usesStudentDialer {
+            log("登录路由：学生客户端协议")
+        } else if request.mode == .teacher {
+            log("登录路由：教师/t 网页认证（当前登录模式强制）")
+        } else {
+            log("登录路由：教师/t 网页认证（账号以 t 开头）")
+        }
     }
 
     private func isCurrentLogin(_ generation: Int) -> Bool {
