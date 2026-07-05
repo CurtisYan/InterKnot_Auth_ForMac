@@ -196,7 +196,7 @@ final class AppModel: ObservableObject {
                         self.settings.username = effectiveRequest.username
                         self.rememberAccount(effectiveRequest.username)
                         self.configStore.save(self.settings)
-                        self.log("登录成功")
+                        self.log(result.message)
                         self.startWatchdogIfNeeded()
                         self.scheduleConnectivityCheck(generation: generation)
                     } else {
@@ -236,15 +236,12 @@ final class AppModel: ObservableObject {
             log("开始注销")
             Task {
                 if shouldUseStudentDialerForCurrentAccount() {
-                    let message = try? await studentDialer.logout { [weak self] logMessage in
-                        Task { @MainActor in self?.log(logMessage) }
-                    }
                     await MainActor.run {
                         self.connectionState = .idle
                         self.isLogoutInProgress = false
                         self.lastSignature = ""
                         self.lastSessionUsername = ""
-                        self.log(message ?? "学生端本地会话已停止")
+                        self.log("当前在线会话不是本程序建立的学生端会话，缺少 term-url，无法主动通知网关下线；请使用天翼校园网手动下线或等待会话过期", level: "ERROR")
                     }
                 } else {
                     await MainActor.run {
