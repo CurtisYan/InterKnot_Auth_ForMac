@@ -46,6 +46,7 @@ final class AppModel: ObservableObject {
     private var isLogoutInProgress = false
     private var isApplyingLaunchAtLogin = false
     private var retryFailedLoginWithWatchdog = false
+    private var lastSessionUsername = ""
 
     init() {
         var loaded = configStore.load()
@@ -182,6 +183,10 @@ final class AppModel: ObservableObject {
                         self.connectionState = .connected(result.message)
                         if let signature = result.signature, !signature.isEmpty {
                             self.lastSignature = signature
+                            self.lastSessionUsername = effectiveRequest.username
+                        } else if self.lastSessionUsername == effectiveRequest.username {
+                            self.lastSignature = ""
+                            self.lastSessionUsername = ""
                         }
                         if self.settings.savePassword {
                             self.credentialStore.save(password: self.password, for: effectiveRequest.username)
@@ -224,7 +229,9 @@ final class AppModel: ObservableObject {
         isProbing = false
         retryFailedLoginWithWatchdog = false
         stopWatchdog()
-        guard !lastSignature.isEmpty else {
+        let requestedUsername = settings.username
+        let sessionSignature = requestedUsername == lastSessionUsername ? lastSignature : ""
+        guard !sessionSignature.isEmpty else {
             connectionState = .loggingOut
             log("开始注销")
             Task {
@@ -235,6 +242,8 @@ final class AppModel: ObservableObject {
                     await MainActor.run {
                         self.connectionState = .idle
                         self.isLogoutInProgress = false
+                        self.lastSignature = ""
+                        self.lastSessionUsername = ""
                         self.log(message ?? "学生端本地会话已停止")
                     }
                 } else {
@@ -252,13 +261,14 @@ final class AppModel: ObservableObject {
         log("开始注销")
         Task {
             do {
-                if lastSignature == StudentDialerService.signatureMarker {
+                if sessionSignature == StudentDialerService.signatureMarker {
                     let message = try await studentDialer.logout { [weak self] logMessage in
                         Task { @MainActor in self?.log(logMessage) }
                     }
                     await MainActor.run {
                         self.connectionState = .idle
                         self.lastSignature = ""
+                        self.lastSessionUsername = ""
                         self.isLogoutInProgress = false
                         self.log(message)
                     }
@@ -270,12 +280,13 @@ final class AppModel: ObservableObject {
                 let message = try await authenticator.logout(
                     settings: settings,
                     userIP: resolvedUserIP(),
-                    account: settings.username,
-                    signature: lastSignature
+                    account: lastSessionUsername,
+                    signature: sessionSignature
                 )
                 await MainActor.run {
                     self.connectionState = .idle
                     self.lastSignature = ""
+                    self.lastSessionUsername = ""
                     self.isLogoutInProgress = false
                     self.log("成功发送下线请求")
                     self.log(message)

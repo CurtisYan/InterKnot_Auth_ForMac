@@ -1,4 +1,5 @@
 import CommonCrypto
+import CryptoKit
 import Foundation
 
 struct StudentDialerLoginResult {
@@ -27,6 +28,10 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
     private var activeSession: StudentSession?
     private var heartbeatTask: Task<Void, Never>?
 
+    var canTerminateActiveSession: Bool {
+        activeSession?.termURL.isEmpty == false
+    }
+
     override init() {
         super.init()
     }
@@ -43,13 +48,22 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
 
     func login(request: LoginRequest, logger: @escaping (String) -> Void) async throws -> StudentDialerLoginResult {
         stopHeartbeat()
+        if let state = activeSession, !state.termURL.isEmpty {
+            logger("学生端：复用本程序已建立的客户端会话")
+            startHeartbeat(logger: logger)
+            return StudentDialerLoginResult(
+                result: LoginResult(success: true, message: "学生端会话已连接", signature: Self.signatureMarker),
+                userIP: state.config.userIP,
+                acIP: state.config.acIP
+            )
+        }
         logger("学生端：检测客户端认证配置")
         let clientID = UUID().uuidString.lowercased()
         let configStatus = try await detectConfig(clientID: clientID)
         guard case .requiresAuthorization(let config) = configStatus else {
             logger("学生端：当前网络已联网，未返回客户端认证配置")
             return StudentDialerLoginResult(
-                result: LoginResult(success: true, message: "学生端检测到当前网络已连接", signature: Self.signatureMarker),
+                result: LoginResult(success: true, message: "学生端检测到当前网络已连接；如果不是本程序建立的会话，将不能使用本程序主动下线", signature: nil),
                 userIP: request.userIP,
                 acIP: ""
             )
@@ -338,11 +352,9 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
 
     private static func md5Hex(_ text: String) -> String {
         let data = Data(text.utf8)
-        var digest = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))
-        data.withUnsafeBytes { buffer in
-            _ = CC_MD5(buffer.baseAddress, CC_LONG(data.count), &digest)
-        }
-        return digest.map { String(format: "%02x", $0) }.joined()
+        return Insecure.MD5.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 }
 
