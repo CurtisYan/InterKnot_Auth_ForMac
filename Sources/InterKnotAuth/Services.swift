@@ -620,15 +620,18 @@ final class WatchdogService {
     private func runLoop() async {
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: UInt64(Self.intervalSeconds) * 1_000_000_000)
+            guard !Task.isCancelled else { return }
             guard hasLocalIP() else { continue }
 
             if await shouldReconnect() {
+                guard !Task.isCancelled else { return }
                 logger("看门狗检测到认证请求失败，准备重连")
                 tryReconnect()
                 continue
             }
 
             let reachable = await anyProbeReachable()
+            guard !Task.isCancelled else { return }
             if !reachable {
                 logger("检测点全部不可达")
                 tryReconnect()
@@ -637,6 +640,7 @@ final class WatchdogService {
     }
 
     private func tryReconnect() {
+        guard !Task.isCancelled else { return }
         let now = Date()
         if let lastReconnectAt,
            now.timeIntervalSince(lastReconnectAt) < TimeInterval(reconnectCooldown) {
@@ -650,6 +654,7 @@ final class WatchdogService {
 
     private func anyProbeReachable() async -> Bool {
         for item in probeURLs {
+            guard !Task.isCancelled else { return true }
             let normalized = item.hasPrefix("http://") || item.hasPrefix("https://")
                 ? item
                 : "https://\(item)"
@@ -665,6 +670,7 @@ final class WatchdogService {
                 reconnectCooldown = Self.intervalSeconds
                 return true
             }
+            guard !Task.isCancelled else { return true }
         }
         return false
     }
