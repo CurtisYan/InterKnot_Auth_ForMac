@@ -32,6 +32,7 @@ final class AppModel: ObservableObject {
     private let configStore = ConfigStore()
     private let credentialStore = CredentialStore()
     private let authenticator = AuthenticationService()
+    private let studentDialer = StudentDialerService()
     private let probeService = ConnectivityProbeService()
     private let easyTier = EasyTierService()
     private let webUI = LocalWebServer()
@@ -96,6 +97,7 @@ final class AppModel: ObservableObject {
         }
         loginTask?.cancel()
         cancelPendingCaptcha()
+        studentDialer.stopHeartbeat()
         loginGeneration += 1
         let generation = loginGeneration
 
@@ -108,8 +110,9 @@ final class AppModel: ObservableObject {
             mode: settings.loginMode
         )
 
-        let shouldRefreshUserIP = account == nil && settings.autoUpdateUserIP
-        guard validateBeforeLogin(request: request, allowRefreshParameters: shouldRefreshUserIP) else {
+        let willUseStudentDialer = shouldUseStudentDialer(for: request)
+        let shouldRefreshUserIP = account == nil && settings.autoUpdateUserIP && !willUseStudentDialer
+        guard validateBeforeLogin(request: request, allowRefreshParameters: shouldRefreshUserIP || willUseStudentDialer) else {
             return
         }
 
@@ -123,25 +126,48 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             do {
                 let preparedRequest = try await self.prepareLoginRequest(request, refreshUserIP: shouldRefreshUserIP)
-                let result = try await authenticator.login(
-                    request: preparedRequest,
-                    settings: settings,
-                    captchaProvider: { [weak self] imageData, suggestedCode in
-                        await self?.requestCaptcha(
-                            imageData: imageData,
-                            title: "输入登录验证码",
-                            submitTitle: "继续登录",
-                            generation: generation,
-                            suggestedCode: suggestedCode
-                        )
-                    },
-                    logger: { [weak self] message in
-                        Task { @MainActor in
-                            guard let self, self.isCurrentLogin(generation) else { return }
-                            self.log(message)
+                let result: LoginResult
+                let effectiveRequest: LoginRequest
+                if self.shouldUseStudentDialer(for: preparedRequest) {
+                    let studentResult = try await studentDialer.login(
+                        request: preparedRequest,
+                        logger: { [weak self] message in
+                            Task { @MainActor in
+                                guard let self, self.isCurrentLogin(generation) else { return }
+                                self.log(message)
+                            }
                         }
+                    )
+                    var updatedRequest = preparedRequest
+                    updatedRequest.userIP = studentResult.userIP
+                    await MainActor.run {
+                        self.settings.wlanUserIP = studentResult.userIP
+                        self.settings.wlanACIP = studentResult.acIP
                     }
-                )
+                    result = studentResult.result
+                    effectiveRequest = updatedRequest
+                } else {
+                    result = try await authenticator.login(
+                        request: preparedRequest,
+                        settings: settings,
+                        captchaProvider: { [weak self] imageData, suggestedCode in
+                            await self?.requestCaptcha(
+                                imageData: imageData,
+                                title: "输入登录验证码",
+                                submitTitle: "继续登录",
+                                generation: generation,
+                                suggestedCode: suggestedCode
+                            )
+                        },
+                        logger: { [weak self] message in
+                            Task { @MainActor in
+                                guard let self, self.isCurrentLogin(generation) else { return }
+                                self.log(message)
+                            }
+                        }
+                    )
+                    effectiveRequest = preparedRequest
+                }
 
                 await MainActor.run {
                     guard self.isCurrentLogin(generation) else { return }
@@ -151,12 +177,12 @@ final class AppModel: ObservableObject {
                             self.lastSignature = signature
                         }
                         if self.settings.savePassword {
-                            self.credentialStore.save(password: self.password, for: preparedRequest.username)
+                            self.credentialStore.save(password: self.password, for: effectiveRequest.username)
                         } else {
-                            self.credentialStore.delete(account: preparedRequest.username)
+                            self.credentialStore.delete(account: effectiveRequest.username)
                         }
-                        self.settings.username = preparedRequest.username
-                        self.rememberAccount(preparedRequest.username)
+                        self.settings.username = effectiveRequest.username
+                        self.rememberAccount(effectiveRequest.username)
                         self.configStore.save(self.settings)
                         self.log("登录成功")
                         self.startWatchdogIfNeeded()
@@ -201,6 +227,18 @@ final class AppModel: ObservableObject {
         log("开始注销")
         Task {
             do {
+                if lastSignature == StudentDialerService.signatureMarker {
+                    let message = try await studentDialer.logout { [weak self] logMessage in
+                        Task { @MainActor in self?.log(logMessage) }
+                    }
+                    await MainActor.run {
+                        self.connectionState = .idle
+                        self.lastSignature = ""
+                        self.isLogoutInProgress = false
+                        self.log(message)
+                    }
+                    return
+                }
                 await MainActor.run {
                     self.log("发送下线请求：\(self.resolvedUserIP())")
                 }
@@ -591,6 +629,10 @@ final class AppModel: ObservableObject {
     private func isUsableLoginIP(_ value: String) -> Bool {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return !trimmed.isEmpty && trimmed != "0.0.0.0"
+    }
+
+    private func shouldUseStudentDialer(for request: LoginRequest) -> Bool {
+        request.mode == .automatic && !request.username.lowercased().hasPrefix("t")
     }
 
     private func isCurrentLogin(_ generation: Int) -> Bool {
