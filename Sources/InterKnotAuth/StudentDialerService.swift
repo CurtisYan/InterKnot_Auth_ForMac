@@ -44,7 +44,16 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
     func login(request: LoginRequest, logger: @escaping (String) -> Void) async throws -> StudentDialerLoginResult {
         stopHeartbeat()
         logger("学生端：检测客户端认证配置")
-        let config = try await detectConfig(clientID: UUID().uuidString.lowercased())
+        let clientID = UUID().uuidString.lowercased()
+        let configStatus = try await detectConfig(clientID: clientID)
+        guard case .requiresAuthorization(let config) = configStatus else {
+            logger("学生端：当前网络已联网，未返回客户端认证配置")
+            return StudentDialerLoginResult(
+                result: LoginResult(success: true, message: "学生端检测到当前网络已连接", signature: Self.signatureMarker),
+                userIP: request.userIP,
+                acIP: ""
+            )
+        }
         logger("学生端：认证 IP \(config.userIP)，AC IP \(config.acIP)")
 
         var state = StudentSession(
@@ -116,7 +125,7 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
         stopHeartbeat()
         guard let state = activeSession, !state.termURL.isEmpty else {
             activeSession = nil
-            return "学生端会话已停止"
+            return "学生端本地会话已停止；当前没有 term-url，无法主动通知网关下线"
         }
         let payload = keepAlivePayload(state: state)
         _ = try await encryptedPostXML(url: state.termURL, payload: payload, state: state)
@@ -155,7 +164,7 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
         }
     }
 
-    private func detectConfig(clientID: String) async throws -> StudentCampusConfig {
+    private func detectConfig(clientID: String) async throws -> StudentConfigStatus {
         guard let url = URL(string: Self.captiveURL) else {
             throw AppError.invalidURL(Self.captiveURL)
         }
@@ -169,7 +178,7 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
         }
         let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .gb18030Student) ?? ""
         guard let portal = Self.extractBetween(Self.portalStart, Self.portalEnd, in: text), !portal.isEmpty else {
-            throw AppError.requestFailed("学生端：当前网络未返回客户端认证配置，可能已经在线或未接入校园网")
+            return .connected
         }
         guard let authURL = Self.firstXMLValue("auth-url", in: portal),
               let ticketURL = Self.firstXMLValue("ticket-url", in: portal),
@@ -183,13 +192,15 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
               !acIP.isEmpty else {
             throw AppError.requestFailed("学生端：ticket-url 缺少 wlanuserip 或 wlanacip")
         }
-        return StudentCampusConfig(
-            clientID: clientID,
-            authURL: authURL,
-            ticketURL: ticketURL,
-            userIP: userIP,
-            acIP: acIP,
-            redirectContext: redirectContext
+        return .requiresAuthorization(
+            StudentCampusConfig(
+                clientID: clientID,
+                authURL: authURL,
+                ticketURL: ticketURL,
+                userIP: userIP,
+                acIP: acIP,
+                redirectContext: redirectContext
+            )
         )
     }
 
@@ -342,6 +353,11 @@ private struct StudentCampusConfig {
     let userIP: String
     let acIP: String
     let redirectContext: StudentRedirectContext
+}
+
+private enum StudentConfigStatus {
+    case connected
+    case requiresAuthorization(StudentCampusConfig)
 }
 
 private struct StudentRedirectContext {

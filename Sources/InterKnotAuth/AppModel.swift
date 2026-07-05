@@ -142,8 +142,14 @@ final class AppModel: ObservableObject {
                     var updatedRequest = preparedRequest
                     updatedRequest.userIP = studentResult.userIP
                     await MainActor.run {
-                        self.settings.wlanUserIP = studentResult.userIP
-                        self.settings.wlanACIP = studentResult.acIP
+                        if !studentResult.userIP.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                           studentResult.userIP != "0.0.0.0" {
+                            self.settings.wlanUserIP = studentResult.userIP
+                        }
+                        if !studentResult.acIP.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                           studentResult.acIP != "0.0.0.0" {
+                            self.settings.wlanACIP = studentResult.acIP
+                        }
                     }
                     result = studentResult.result
                     effectiveRequest = updatedRequest
@@ -219,8 +225,26 @@ final class AppModel: ObservableObject {
         retryFailedLoginWithWatchdog = false
         stopWatchdog()
         guard !lastSignature.isEmpty else {
-            log("您尚未登录，无需下线！")
-            isLogoutInProgress = false
+            connectionState = .loggingOut
+            log("开始注销")
+            Task {
+                if shouldUseStudentDialerForCurrentAccount() {
+                    let message = try? await studentDialer.logout { [weak self] logMessage in
+                        Task { @MainActor in self?.log(logMessage) }
+                    }
+                    await MainActor.run {
+                        self.connectionState = .idle
+                        self.isLogoutInProgress = false
+                        self.log(message ?? "学生端本地会话已停止")
+                    }
+                } else {
+                    await MainActor.run {
+                        self.connectionState = .idle
+                        self.isLogoutInProgress = false
+                        self.log("本地没有网页登录 signature，无法主动通知网关下线；请先重新登录或等待网关会话过期", level: "ERROR")
+                    }
+                }
+            }
             return
         }
 
@@ -634,6 +658,10 @@ final class AppModel: ObservableObject {
 
     private func shouldUseStudentDialer(for request: LoginRequest) -> Bool {
         request.mode == .automatic && !request.username.lowercased().hasPrefix("t")
+    }
+
+    private func shouldUseStudentDialerForCurrentAccount() -> Bool {
+        settings.loginMode == .automatic && !settings.username.lowercased().hasPrefix("t")
     }
 
     private func logLoginRoute(_ request: LoginRequest, usesStudentDialer: Bool) {
