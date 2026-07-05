@@ -1,10 +1,16 @@
 import AppKit
+import Darwin
 import SwiftUI
 
 @main
 struct InterKnotAuthApp: App {
-    @StateObject private var model = AppModel()
+    @StateObject private var model: AppModel
     @Environment(\.openWindow) private var openWindow
+
+    init() {
+        SingleInstanceGuard.enforce()
+        _model = StateObject(wrappedValue: AppModel())
+    }
 
     var body: some Scene {
         WindowGroup("绳网认证", id: "main") {
@@ -58,5 +64,19 @@ struct InterKnotAuthApp: App {
                 NSApp.terminate(nil)
             }
         }
+    }
+}
+
+private enum SingleInstanceGuard {
+    static func enforce() {
+        let bundleIdentifier = Bundle.main.bundleIdentifier ?? "com.interknot.auth"
+        let currentPID = NSRunningApplication.current.processIdentifier
+        let existing = NSRunningApplication
+            .runningApplications(withBundleIdentifier: bundleIdentifier)
+            .first { $0.processIdentifier != currentPID }
+
+        guard let existing else { return }
+        existing.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        exit(0)
     }
 }

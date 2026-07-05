@@ -43,7 +43,9 @@ final class AppModel: ObservableObject {
     private var isApplyingLaunchAtLogin = false
 
     init() {
-        let loaded = configStore.load()
+        var loaded = configStore.load()
+        loaded.username = loaded.username.sanitizedAccountIdentifier
+        loaded.accountHistory = Self.normalizedAccountHistory(loaded.accountHistory, current: loaded.username)
         settings = loaded
         password = credentialStore.password(for: loaded.username) ?? ""
         log("欢迎使用 InterKnot for macOS")
@@ -69,6 +71,11 @@ final class AppModel: ObservableObject {
 
     func reloadPassword() {
         password = credentialStore.password(for: settings.username) ?? ""
+    }
+
+    func selectAccount(_ account: String) {
+        settings.username = account.sanitizedAccountIdentifier
+        reloadPassword()
     }
 
     func login(account: MultiLoginAccount? = nil, force: Bool = false) {
@@ -98,6 +105,7 @@ final class AppModel: ObservableObject {
             return
         }
 
+        stopWatchdog()
         connectionState = .loggingIn
         log("开始认证：\(request.username)，IP：\(request.userIP)")
 
@@ -135,10 +143,11 @@ final class AppModel: ObservableObject {
                             self.credentialStore.save(password: self.password, for: request.username)
                         }
                         self.settings.username = request.username
+                        self.rememberAccount(request.username)
                         self.configStore.save(self.settings)
                         self.log("登录成功")
                         self.startWatchdogIfNeeded()
-                        self.checkConnectivity()
+                        self.scheduleConnectivityCheck(generation: generation)
                     } else {
                         self.fail(result.message)
                     }
@@ -294,7 +303,7 @@ final class AppModel: ObservableObject {
                 if let fastest = results.filter(\.success).compactMap(\.latencyMS).min() {
                     self.log("访问检测完成，最快 \(fastest) ms")
                 } else {
-                    self.log("访问检测失败：所有目标不可达", level: "ERROR")
+                    self.log("外网访问检测失败：所有检测点不可达，认证已成功但网络可能尚未放行或检测点被拦截", level: "ERROR")
                 }
             }
         }
@@ -428,6 +437,35 @@ final class AppModel: ObservableObject {
         persistPassword(password)
     }
 
+    private func rememberAccount(_ account: String) {
+        let sanitized = account.sanitizedAccountIdentifier
+        guard !sanitized.isEmpty else { return }
+        settings.accountHistory.removeAll { $0 == sanitized }
+        settings.accountHistory.insert(sanitized, at: 0)
+        if settings.accountHistory.count > 12 {
+            settings.accountHistory.removeLast(settings.accountHistory.count - 12)
+        }
+    }
+
+    private static func normalizedAccountHistory(_ history: [String], current: String) -> [String] {
+        var result: [String] = []
+        for account in [current] + history {
+            let sanitized = account.sanitizedAccountIdentifier
+            guard !sanitized.isEmpty, !result.contains(sanitized) else { continue }
+            result.append(sanitized)
+            if result.count == 12 { break }
+        }
+        return result
+    }
+
+    private func scheduleConnectivityCheck(generation: Int) {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard self.isCurrentLogin(generation) else { return }
+            self.checkConnectivity()
+        }
+    }
+
     private func persistPassword(_ password: String) {
         if settings.savePassword, !settings.username.isEmpty, !password.isEmpty {
             credentialStore.save(password: password, for: settings.username)
@@ -483,6 +521,9 @@ final class AppModel: ObservableObject {
         if request.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             missing.insert(.username)
         }
+        if request.username != request.username.sanitizedAccountIdentifier {
+            missing.insert(.username)
+        }
         if request.password.isEmpty {
             missing.insert(.password)
         }
@@ -497,7 +538,11 @@ final class AppModel: ObservableObject {
         }
 
         missingFields = missing
-        validationMessage = missing.isEmpty ? "" : "请补全：\(missing.map(\.title).sorted().joined(separator: "、"))"
+        if missing.contains(.username), request.username != request.username.sanitizedAccountIdentifier {
+            validationMessage = "账号只能输入一行英文字母或数字，不能包含空格或符号"
+        } else {
+            validationMessage = missing.isEmpty ? "" : "请补全：\(missing.map(\.title).sorted().joined(separator: "、"))"
+        }
         guard missing.isEmpty else {
             if missing.contains(.username) || missing.contains(.password) {
                 selectedSection = .accounts

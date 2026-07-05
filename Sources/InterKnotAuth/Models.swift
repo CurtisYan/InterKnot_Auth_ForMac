@@ -103,6 +103,7 @@ struct AppSettings: Codable, Equatable {
     ]
 
     var username: String = ""
+    var accountHistory: [String] = []
     var savePassword: Bool = true
     var autoConnect: Bool = false
     var launchAtLogin: Bool = false
@@ -125,6 +126,7 @@ struct AppSettings: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case username
+        case accountHistory
         case savePassword
         case autoConnect
         case launchAtLogin
@@ -147,6 +149,7 @@ struct AppSettings: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         username = try container.decodeIfPresent(String.self, forKey: .username) ?? ""
+        accountHistory = try container.decodeIfPresent([String].self, forKey: .accountHistory) ?? []
         savePassword = try container.decodeIfPresent(Bool.self, forKey: .savePassword) ?? true
         autoConnect = try container.decodeIfPresent(Bool.self, forKey: .autoConnect) ?? false
         launchAtLogin = try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false

@@ -75,6 +75,9 @@ final class ConfigStore {
 
         var settings = AppSettings.empty
         settings.username = dict["username"] ?? ""
+        if !settings.username.isEmpty {
+            settings.accountHistory = [settings.username]
+        }
         settings.esurfingURL = dict["esurfingurl"] ?? ""
         settings.wlanACIP = dict["wlanacip"] ?? "0.0.0.0"
         settings.wlanUserIP = dict["wlanuserip"] ?? "0.0.0.0"

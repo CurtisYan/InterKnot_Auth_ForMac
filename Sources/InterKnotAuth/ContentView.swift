@@ -262,12 +262,7 @@ private struct AccountView: View {
     var body: some View {
         Form {
             Section("主账号") {
-                RequiredTextField(
-                    "学号 / 工号",
-                    text: $model.settings.username,
-                    isMissing: model.missingFields.contains(.username)
-                )
-                    .onSubmit { model.reloadPassword() }
+                AccountHistoryField()
                 RequiredSecureField(
                     "密码",
                     text: $model.password,
@@ -291,6 +286,22 @@ private struct AccountView: View {
         }
         .formStyle(.grouped)
         .padding(18)
+    }
+}
+
+private struct AccountHistoryField: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 4) {
+            RequiredMark(isVisible: model.missingFields.contains(.username))
+            AccountComboBox(
+                text: $model.settings.username,
+                history: model.settings.accountHistory,
+                onCommit: { model.reloadPassword() },
+                onSelect: { model.selectAccount($0) }
+            )
+        }
     }
 }
 
@@ -430,7 +441,7 @@ private struct MultiLoginView: View {
                     TextField("线路", text: $account.label)
                 }
                 TableColumn("账号") { $account in
-                    TextField("账号", text: $account.username)
+                    TextField("账号", text: sanitizedAccountBinding($account.username))
                 }
                 TableColumn("密码") { $account in
                     SecureField("留空使用主密码", text: $account.password)
@@ -569,17 +580,108 @@ private struct FieldSummary: View {
     }
 }
 
+private func sanitizedAccountBinding(_ binding: Binding<String>) -> Binding<String> {
+    Binding(
+        get: { binding.wrappedValue },
+        set: { binding.wrappedValue = $0.sanitizedAccountIdentifier }
+    )
+}
+
+private struct AccountComboBox: NSViewRepresentable {
+    @Binding var text: String
+    let history: [String]
+    let onCommit: () -> Void
+    let onSelect: (String) -> Void
+
+    func makeNSView(context: Context) -> NSComboBox {
+        let comboBox = NSComboBox()
+        comboBox.usesDataSource = false
+        comboBox.completes = true
+        comboBox.numberOfVisibleItems = 8
+        comboBox.isButtonBordered = true
+        comboBox.delegate = context.coordinator
+        comboBox.target = context.coordinator
+        comboBox.action = #selector(Coordinator.commitEditing(_:))
+        return comboBox
+    }
+
+    func updateNSView(_ comboBox: NSComboBox, context: Context) {
+        context.coordinator.parent = self
+        if comboBox.stringValue != text {
+            comboBox.stringValue = text
+        }
+
+        let currentItems = (0..<comboBox.numberOfItems).compactMap { comboBox.itemObjectValue(at: $0) as? String }
+        if currentItems != history {
+            comboBox.removeAllItems()
+            comboBox.addItems(withObjectValues: history)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    final class Coordinator: NSObject, NSComboBoxDelegate {
+        var parent: AccountComboBox
+
+        init(parent: AccountComboBox) {
+            self.parent = parent
+        }
+
+        @objc func commitEditing(_ sender: NSComboBox) {
+            updateText(from: sender, commit: true)
+        }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let comboBox = notification.object as? NSComboBox else { return }
+            updateText(from: comboBox, commit: false)
+        }
+
+        func controlTextDidEndEditing(_ notification: Notification) {
+            guard let comboBox = notification.object as? NSComboBox else { return }
+            updateText(from: comboBox, commit: true)
+        }
+
+        func comboBoxSelectionDidChange(_ notification: Notification) {
+            guard let comboBox = notification.object as? NSComboBox,
+                  comboBox.indexOfSelectedItem >= 0,
+                  let selected = comboBox.itemObjectValue(at: comboBox.indexOfSelectedItem) as? String else { return }
+            parent.onSelect(selected)
+        }
+
+        private func updateText(from comboBox: NSComboBox, commit: Bool) {
+            let sanitized = comboBox.stringValue.sanitizedAccountIdentifier
+            if comboBox.stringValue != sanitized {
+                comboBox.stringValue = sanitized
+            }
+            parent.text = sanitized
+            if commit {
+                parent.onCommit()
+            }
+        }
+    }
+}
+
 private struct RequiredTextField: View {
     let placeholder: String
     let label: String?
     @Binding var text: String
     let isMissing: Bool
+    let sanitize: ((String) -> String)?
 
-    init(_ placeholder: String, label: String? = nil, text: Binding<String>, isMissing: Bool) {
+    init(
+        _ placeholder: String,
+        label: String? = nil,
+        text: Binding<String>,
+        isMissing: Bool,
+        sanitize: ((String) -> String)? = nil
+    ) {
         self.placeholder = placeholder
         self.label = label
         self._text = text
         self.isMissing = isMissing
+        self.sanitize = sanitize
     }
 
     var body: some View {
@@ -589,9 +691,17 @@ private struct RequiredTextField: View {
                     .frame(width: 110, alignment: .leading)
             }
             RequiredMark(isVisible: isMissing)
-            TextField(placeholder, text: $text)
+            TextField(placeholder, text: fieldText)
                 .textFieldStyle(.roundedBorder)
+                .lineLimit(1)
         }
+    }
+
+    private var fieldText: Binding<String> {
+        Binding(
+            get: { text },
+            set: { text = sanitize?($0) ?? $0 }
+        )
     }
 }
 
@@ -599,6 +709,7 @@ private struct RequiredSecureField: View {
     let placeholder: String
     @Binding var text: String
     let isMissing: Bool
+    @State private var isRevealing = false
 
     init(_ placeholder: String, text: Binding<String>, isMissing: Bool) {
         self.placeholder = placeholder
@@ -609,9 +720,74 @@ private struct RequiredSecureField: View {
     var body: some View {
         HStack(spacing: 4) {
             RequiredMark(isVisible: isMissing)
-            SecureField(placeholder, text: $text)
-                .textFieldStyle(.roundedBorder)
+            Group {
+                if isRevealing {
+                    TextField(placeholder, text: $text)
+                } else {
+                    SecureField(placeholder, text: $text)
+                }
+            }
+            .textFieldStyle(.roundedBorder)
+            .lineLimit(1)
+
+            PressAndHoldRevealButton(isRevealing: $isRevealing)
+                .frame(width: 28, height: 24)
+                .help("按住显示密码")
         }
+    }
+}
+
+private struct PressAndHoldRevealButton: NSViewRepresentable {
+    @Binding var isRevealing: Bool
+
+    func makeNSView(context: Context) -> HoldButton {
+        let button = HoldButton()
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.setButtonType(.momentaryChange)
+        button.onPressChanged = { isPressed in
+            isRevealing = isPressed
+        }
+        return button
+    }
+
+    func updateNSView(_ button: HoldButton, context: Context) {
+        button.image = NSImage(
+            systemSymbolName: isRevealing ? "eye.fill" : "eye",
+            accessibilityDescription: "按住显示密码"
+        )
+        button.contentTintColor = .secondaryLabelColor
+    }
+}
+
+private final class HoldButton: NSButton {
+    var onPressChanged: ((Bool) -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        highlight(true)
+        onPressChanged?(true)
+        var shouldContinue = true
+        while shouldContinue {
+            guard let nextEvent = window?.nextEvent(
+                matching: [.leftMouseUp, .leftMouseDragged],
+                until: .distantFuture,
+                inMode: .eventTracking,
+                dequeue: true
+            ) else { continue }
+
+            switch nextEvent.type {
+            case .leftMouseUp:
+                shouldContinue = false
+            case .leftMouseDragged:
+                let point = convert(nextEvent.locationInWindow, from: nil)
+                onPressChanged?(bounds.contains(point))
+            default:
+                break
+            }
+        }
+        onPressChanged?(false)
+        highlight(false)
     }
 }
 
