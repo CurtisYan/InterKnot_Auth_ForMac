@@ -51,9 +51,8 @@ final class AppModel: ObservableObject {
     init() {
         var loaded = configStore.load()
         loaded.username = loaded.username.sanitizedAccountIdentifier
-        loaded.accountHistory = Self.normalizedAccountHistory(loaded.accountHistory, current: loaded.username)
+        loaded.accountHistory = Self.normalizedAccountHistory(loaded.accountHistory)
         settings = loaded
-        password = credentialStore.password(for: loaded.username) ?? ""
         log("欢迎使用 InterKnot for macOS")
         log("配置已加载")
         bindAutoSave()
@@ -62,7 +61,7 @@ final class AppModel: ObservableObject {
         if loaded.autoShare {
             startEasyTierServer()
         }
-        if loaded.autoConnect, loaded.savePassword, !loaded.username.isEmpty, !password.isEmpty {
+        if loaded.autoConnect, loaded.savePassword, !loaded.username.isEmpty {
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 600_000_000)
                 login()
@@ -76,12 +75,24 @@ final class AppModel: ObservableObject {
     }
 
     func reloadPassword() {
-        password = credentialStore.password(for: settings.username) ?? ""
+        password = credentialStore.password(for: settings.username, allowUserPrompt: true) ?? ""
     }
 
     func selectAccount(_ account: String) {
         settings.username = account.sanitizedAccountIdentifier
-        reloadPassword()
+        password = ""
+    }
+
+    func removeAccountFromHistory(_ account: String) {
+        let sanitized = account.sanitizedAccountIdentifier
+        guard !sanitized.isEmpty else { return }
+        settings.accountHistory.removeAll { $0 == sanitized }
+        credentialStore.delete(account: sanitized)
+        if settings.username == sanitized {
+            settings.username = settings.accountHistory.first ?? ""
+            password = ""
+        }
+        log("已删除账号历史：\(sanitized)")
     }
 
     func login(account: MultiLoginAccount? = nil, force: Bool = false) {
@@ -104,6 +115,12 @@ final class AppModel: ObservableObject {
 
         let username = account?.username.isEmpty == false ? account!.username : settings.username
         let userIP = account?.userIP.isEmpty == false ? account!.userIP : settings.wlanUserIP
+        if account == nil,
+           password.isEmpty,
+           settings.savePassword,
+           let savedPassword = credentialStore.password(for: username, allowUserPrompt: true) {
+            password = savedPassword
+        }
         let request = LoginRequest(
             username: username,
             password: password,
@@ -324,7 +341,7 @@ final class AppModel: ObservableObject {
     }
 
     func detectCampusParameters() {
-        log("尝试从广东天翼重定向自动获取认证参数")
+        log("尝试自动获取认证参数")
         Task { [weak self] in
             guard let self else { return }
             do {
@@ -339,7 +356,7 @@ final class AppModel: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.fail("自动获取认证参数失败：\(error.localizedDescription)")
-                    self.log("请连接校园网络并关闭代理；然后在浏览器访问 2.2.2.2，将跳转后的完整地址复制到认证参数页解析", level: "INFO")
+                    self.log("请关闭代理，并开启浏览器无痕模式访问 2.2.2.2；如果能跳转，把完整地址复制到账号页手动解析", level: "INFO")
                 }
             }
         }
@@ -532,9 +549,9 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private static func normalizedAccountHistory(_ history: [String], current: String) -> [String] {
+    private static func normalizedAccountHistory(_ history: [String]) -> [String] {
         var result: [String] = []
-        for account in [current] + history {
+        for account in history {
             let sanitized = account.sanitizedAccountIdentifier
             guard !sanitized.isEmpty, !result.contains(sanitized) else { continue }
             result.append(sanitized)
@@ -625,7 +642,7 @@ final class AppModel: ObservableObject {
             if missing.contains(.username) || missing.contains(.password) {
                 selectedSection = .accounts
             } else {
-                selectedSection = .network
+                selectedSection = .accounts
             }
             fail(validationMessage)
             return false
@@ -640,12 +657,11 @@ final class AppModel: ObservableObject {
         var prepared = request
         do {
             let params = try await authenticator.detectParameters()
-            settings.esurfingURL = params.esurfingURL
             settings.wlanACIP = params.wlanACIP
             settings.wlanUserIP = params.wlanUserIP
-            missingFields.subtract([.esurfingURL, .wlanACIP, .wlanUserIP])
+            missingFields.subtract([.wlanACIP, .wlanUserIP])
             prepared.userIP = params.wlanUserIP
-            log("自动更新认证 IP 成功：\(params.wlanUserIP)")
+            log("自动更新认证 IP 成功：\(params.wlanUserIP)，保留认证网关：\(settings.esurfingURL)")
         } catch {
             log("自动更新认证 IP 失败：\(error.localizedDescription)，继续使用当前配置", level: "ERROR")
         }

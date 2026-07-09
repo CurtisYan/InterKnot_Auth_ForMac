@@ -13,7 +13,7 @@ struct InterKnotAuthApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("绳网认证", id: "main") {
+        Window("绳网认证", id: "main") {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 1040, minHeight: 680)

@@ -59,7 +59,6 @@ private struct SidebarView: View {
         switch section {
         case .dashboard: return "gauge.with.dots.needle.67percent"
         case .accounts: return "person.crop.circle"
-        case .network: return "network"
         case .multiLogin: return "square.stack.3d.up"
         case .tunnel: return "point.3.connected.trianglepath.dotted"
         case .settings: return "gearshape"
@@ -100,8 +99,6 @@ private struct MainDetailContent: View {
                     DashboardView()
                 case .accounts:
                     AccountView()
-                case .network:
-                    NetworkSettingsView()
                 case .multiLogin:
                     MultiLoginView()
                 case .tunnel:
@@ -121,8 +118,11 @@ private struct HeaderView: View {
     var body: some View {
         HStack(spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("InterKnot")
+                Link("InterKnot", destination: URL(string: "https://github.com/CurtisYan/InterKnot_Auth_ForMac")!)
                     .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .buttonStyle(.plain)
+                    .help("打开 GitHub 仓库")
                 Link("绳网认证 for macOS", destination: URL(string: "https://github.com/CurtisYan/InterKnot_Auth_ForMac")!)
                     .foregroundStyle(.secondary)
                     .buttonStyle(.plain)
@@ -191,7 +191,7 @@ private struct DashboardView: View {
                         Button {
                             model.detectCampusParameters()
                         } label: {
-                            Label("自动获取认证参数", systemImage: "wand.and.stars")
+                            Label("自动获取", systemImage: "wand.and.stars")
                         }
                     }
                 }
@@ -274,13 +274,59 @@ private struct AccountView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-            }
-
-            Section {
                 HStack {
                     Button("登录") { model.login() }
                         .buttonStyle(.borderedProminent)
                     Button("注销") { model.logout() }
+                }
+            }
+
+            Section("认证参数") {
+                RequiredTextField(
+                    "认证网关，例如 enet.10000.gd.cn:10001",
+                    label: "认证网关",
+                    text: $model.settings.esurfingURL,
+                    isMissing: model.missingFields.contains(.esurfingURL)
+                )
+                RequiredTextField(
+                    "WLAN AC IP",
+                    label: "WLAN AC IP",
+                    text: $model.settings.wlanACIP,
+                    isMissing: model.missingFields.contains(.wlanACIP)
+                )
+                RequiredTextField(
+                    "校园网认证 IP",
+                    label: "认证 IP",
+                    text: $model.settings.wlanUserIP,
+                    isMissing: model.missingFields.contains(.wlanUserIP)
+                )
+                HStack {
+                    Button {
+                        model.detectCampusParameters()
+                    } label: {
+                        Label("自动获取", systemImage: "wand.and.stars")
+                    }
+                    Button {
+                        model.showManualParseSheet = true
+                    } label: {
+                        Label("手动解析", systemImage: "link.badge.plus")
+                    }
+                }
+            }
+
+            Section("登录密钥") {
+                Text("这是广东天翼登录接口使用的 RSA 公钥，已按 InterKnot 仓库默认值内置，通常不用修改。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button {
+                    model.restoreDefaultRSAPublicKey()
+                } label: {
+                    Label("恢复默认公钥", systemImage: "arrow.counterclockwise")
+                }
+                DisclosureGroup("高级：查看或替换 RSA 公钥") {
+                    TextEditor(text: $model.settings.rsaPublicKey)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(minHeight: 120)
                 }
             }
         }
@@ -298,9 +344,27 @@ private struct AccountHistoryField: View {
             AccountComboBox(
                 text: $model.settings.username,
                 history: model.settings.accountHistory,
-                onCommit: { model.reloadPassword() },
+                onCommit: {},
                 onSelect: { model.selectAccount($0) }
             )
+            Menu {
+                if model.settings.accountHistory.isEmpty {
+                    Text("没有历史账号")
+                } else {
+                    ForEach(model.settings.accountHistory, id: \.self) { account in
+                        Button(role: .destructive) {
+                            model.removeAccountFromHistory(account)
+                        } label: {
+                            Label(account, systemImage: "trash")
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: "trash")
+                    .frame(width: 28, height: 24)
+            }
+            .menuStyle(.borderlessButton)
+            .help("删除历史账号")
         }
     }
 }
@@ -339,66 +403,6 @@ private struct SettingsView: View {
         .onAppear {
             model.syncLaunchAtLoginStatus()
         }
-    }
-}
-
-private struct NetworkSettingsView: View {
-    @EnvironmentObject private var model: AppModel
-
-    var body: some View {
-        Form {
-            Section("ESurfing 参数") {
-                RequiredTextField(
-                    "认证网关，例如 enet.10000.gd.cn:10001",
-                    label: "认证网关",
-                    text: $model.settings.esurfingURL,
-                    isMissing: model.missingFields.contains(.esurfingURL)
-                )
-                RequiredTextField(
-                    "WLAN AC IP",
-                    label: "WLAN AC IP",
-                    text: $model.settings.wlanACIP,
-                    isMissing: model.missingFields.contains(.wlanACIP)
-                )
-                HStack {
-                    RequiredTextField(
-                        "校园网认证 IP",
-                        label: "认证 IP",
-                        text: $model.settings.wlanUserIP,
-                        isMissing: model.missingFields.contains(.wlanUserIP)
-                    )
-                }
-                Button {
-                    model.detectCampusParameters()
-                } label: {
-                    Label("从广东天翼重定向自动获取", systemImage: "wand.and.stars")
-                }
-                Button {
-                    model.showManualParseSheet = true
-                } label: {
-                    Label("手动解析", systemImage: "link.badge.plus")
-                }
-            }
-
-            Section("登录密钥") {
-                Text("这是广东天翼登录接口使用的 RSA 公钥，已按 InterKnot 仓库默认值内置，通常不用修改。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Button {
-                    model.restoreDefaultRSAPublicKey()
-                } label: {
-                    Label("恢复默认公钥", systemImage: "arrow.counterclockwise")
-                }
-                DisclosureGroup("高级：查看或替换 RSA 公钥") {
-                    TextEditor(text: $model.settings.rsaPublicKey)
-                        .font(.system(.body, design: .monospaced))
-                        .frame(minHeight: 120)
-                }
-            }
-
-        }
-        .formStyle(.grouped)
-        .padding(18)
     }
 }
 

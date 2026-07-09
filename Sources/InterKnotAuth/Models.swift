@@ -3,7 +3,6 @@ import Foundation
 enum AppSection: String, CaseIterable, Identifiable {
     case dashboard = "概览"
     case accounts = "账号"
-    case network = "认证参数"
     case multiLogin = "多拨"
     case tunnel = "隧道"
     case settings = "设置"

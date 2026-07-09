@@ -194,10 +194,9 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
         guard let portal = Self.extractBetween(Self.portalStart, Self.portalEnd, in: text), !portal.isEmpty else {
             return .connected
         }
-        guard let authURL = Self.firstXMLValue("auth-url", in: portal),
-              let ticketURL = Self.firstXMLValue("ticket-url", in: portal),
-              let ticketComponents = URLComponents(string: ticketURL) else {
-            throw AppError.requestFailed("学生端：认证配置缺少 auth-url 或 ticket-url")
+        guard let configURLs = Self.extractConfigURLs(from: portal),
+              let ticketComponents = URLComponents(string: configURLs.ticketURL) else {
+            throw AppError.requestFailed("学生端：认证配置缺少 auth-url 或 ticket-url（\(Self.responseSummary(portal))）")
         }
         let queryItems = ticketComponents.queryItems ?? []
         guard let userIP = queryItems.first(where: { $0.name.lowercased() == "wlanuserip" })?.value,
@@ -209,8 +208,8 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
         return .requiresAuthorization(
             StudentCampusConfig(
                 clientID: clientID,
-                authURL: authURL,
-                ticketURL: ticketURL,
+                authURL: configURLs.authURL,
+                ticketURL: configURLs.ticketURL,
                 userIP: userIP,
                 acIP: acIP,
                 redirectContext: redirectContext
@@ -320,6 +319,27 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
         return String(text[startRange.upperBound..<endRange.lowerBound])
     }
 
+    private static func extractConfigURLs(from portal: String) -> (authURL: String, ticketURL: String)? {
+        let decodedPortal = portal.htmlEntityDecoded
+        guard let authURL = firstConfigValue(names: ["auth-url", "authUrl"], in: decodedPortal),
+              let ticketURL = firstConfigValue(names: ["ticket-url", "ticketUrl"], in: decodedPortal) else {
+            return nil
+        }
+        return (authURL, ticketURL)
+    }
+
+    private static func firstConfigValue(names: [String], in text: String) -> String? {
+        for name in names {
+            if let value = firstXMLValue(name, in: text) {
+                return value
+            }
+            if let value = firstKeyValue(name, in: text) {
+                return value
+            }
+        }
+        return nil
+    }
+
     private static func firstXMLValue(_ tag: String, in text: String) -> String? {
         let pattern = "<\(NSRegularExpression.escapedPattern(for: tag))[^>]*>\\s*([^<]*)\\s*</\(NSRegularExpression.escapedPattern(for: tag))>"
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
@@ -330,6 +350,28 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
             return nil
         }
         return String(text[captureRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func firstKeyValue(_ key: String, in text: String) -> String? {
+        let escapedKey = NSRegularExpression.escapedPattern(for: key)
+        let pattern = #"(?i)(?:["']?\#(escapedKey)["']?\s*[:=]\s*)(["'])(.*?)\1"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+              match.numberOfRanges > 2,
+              let captureRange = Range(match.range(at: 2), in: text) else {
+            return nil
+        }
+        let value = String(text[captureRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private static func responseSummary(_ text: String) -> String {
+        let collapsed = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(collapsed.prefix(180))
     }
 
     private static func localTime() -> String {
@@ -355,6 +397,23 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
         return Insecure.MD5.hash(data: data)
             .map { String(format: "%02x", $0) }
             .joined()
+    }
+}
+
+private extension String {
+    var htmlEntityDecoded: String {
+        var decoded = self
+        for (entity, value) in [
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&#39;", "'"),
+            ("&apos;", "'"),
+            ("&amp;", "&")
+        ] {
+            decoded = decoded.replacingOccurrences(of: entity, with: value, options: [.caseInsensitive])
+        }
+        return decoded
     }
 }
 

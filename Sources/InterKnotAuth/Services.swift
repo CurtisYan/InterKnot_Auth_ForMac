@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Network
 import Security
 
@@ -112,14 +113,17 @@ final class CredentialStore {
         SecItemAdd(query as CFDictionary, nil)
     }
 
-    func password(for account: String) -> String? {
+    func password(for account: String, allowUserPrompt: Bool) -> String? {
         guard !account.isEmpty else { return nil }
+        let context = LAContext()
+        context.interactionNotAllowed = !allowUserPrompt
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationContext as String: context
         ]
         var result: AnyObject?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
@@ -139,20 +143,34 @@ final class CredentialStore {
     }
 }
 
-final class AuthenticationService {
-    private let session: URLSession
+final class AuthenticationService: NSObject, URLSessionTaskDelegate {
+    private var session: URLSession!
 
     private struct LoginAttempt {
         let result: LoginResult
         let usedAutomaticCaptcha: Bool
     }
 
-    init() {
+    override init() {
+        super.init()
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 8
         configuration.httpCookieStorage = .shared
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        session = URLSession(configuration: configuration)
+        session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge
+    ) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              challenge.protectionSpace.host == "2.2.2.2",
+              let trust = challenge.protectionSpace.serverTrust else {
+            return (.performDefaultHandling, nil)
+        }
+        return (.useCredential, URLCredential(trust: trust))
     }
 
     func login(
@@ -285,14 +303,28 @@ final class AuthenticationService {
 
     func detectParameters() async throws -> CampusParameters {
         var errors: [String] = []
-        for target in ["http://189.cn/", "http://connect.rom.miui.com/generate_204"] {
+        for target in [
+            "http://189.cn/",
+            "http://2.2.2.2/",
+            "https://2.2.2.2/",
+            "http://captive.apple.com/hotspot-detect.html",
+            "http://connect.rom.miui.com/generate_204",
+            "http://www.msftconnecttest.com/connecttest.txt"
+        ] {
             do {
-                return try await detectParameters(from: target)
+                let params = try await detectParameters(from: target)
+                do {
+                    try await validateCampusParameters(params)
+                    return params
+                } catch {
+                    errors.append("\(params.esurfingURL)：\(error.localizedDescription)")
+                }
             } catch {
                 errors.append(error.localizedDescription)
             }
         }
-        throw AppError.requestFailed(errors.last ?? "没有收到广东天翼重定向 URL")
+        let details = Array(Set(errors)).prefix(3).joined(separator: "；")
+        throw AppError.requestFailed(details.isEmpty ? "没有收到广东天翼重定向 URL" : details)
     }
 
     func parseParameters(from redirectURL: String) throws -> CampusParameters {
@@ -357,11 +389,12 @@ final class AuthenticationService {
     private func detectParameters(from target: String) async throws -> CampusParameters {
         let targetURL = try url(target)
         var request = URLRequest(url: targetURL)
-        request.timeoutInterval = 4
+        request.timeoutInterval = 7
         request.setValue("CCTP/android64_vpn/2093", forHTTPHeaderField: "User-Agent")
         request.setValue("text/html,text/xml,application/xhtml+xml,application/x-javascript,*/*", forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: request)
 
+        let responseURL = (response as? HTTPURLResponse)?.url ?? targetURL
         if let finalURL = (response as? HTTPURLResponse)?.url?.absoluteString,
            finalURL != target,
            let params = try? parseParameters(from: finalURL) {
@@ -369,11 +402,57 @@ final class AuthenticationService {
         }
 
         let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .gb18030) ?? ""
+        for candidate in redirectURLCandidates(from: text, responseURL: responseURL) {
+            if let params = try? parseParameters(from: candidate) {
+                return params
+            }
+        }
         if let params = try? parsePortalConfig(from: text) {
             return params
         }
 
         throw AppError.requestFailed("没有收到广东天翼重定向 URL")
+    }
+
+    private func validateCampusParameters(_ params: CampusParameters) async throws {
+        let base = normalizeBaseURL(params.esurfingURL)
+        let pageURL = try url("\(base)/qs/index_gz.jsp?wlanacip=\(params.wlanACIP.urlFormEscaped)&wlanuserip=\(params.wlanUserIP.urlFormEscaped)")
+        let pageHTML = try await fetchText(pageURL)
+        let lower = pageHTML.lowercased()
+        guard extractCaptchaURL(from: pageHTML, pageURL: pageURL) != nil
+                || lower.contains("image_code")
+                || lower.contains("/ajax/login")
+                || lower.contains("index_gz.jsp")
+                || lower.contains("wlanuserip")
+                || lower.contains("验证码")
+                || lower.contains("登录") else {
+            throw AppError.requestFailed("认证页面无效：\(pageURL.absoluteString)")
+        }
+    }
+
+    private func redirectURLCandidates(from text: String, responseURL: URL) -> [String] {
+        let decoded = text.htmlEntityDecodedForService
+        let patterns = [
+            #"https?://[^\s"'<>]+[?&]wlanacip=[^\s"'<>]+[&;]wlanuserip=[^\s"'<>]+"#,
+            #"(?i)url\s*=\s*['"]?([^'"\s<>]+[?&]wlanacip=[^'"\s<>]+[&;]wlanuserip=[^'"\s<>]+)"#,
+            #"(?i)location(?:\.href)?\s*=\s*['"]([^'"]+[?&]wlanacip=[^'"]+[&;]wlanuserip=[^'"]+)['"]"#,
+            #"(?i)content\s*=\s*['"][^'"]*url=([^'"]+[?&]wlanacip=[^'"]+[&;]wlanuserip=[^'"]+)['"]"#
+        ]
+        var candidates: [String] = []
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(decoded.startIndex..<decoded.endIndex, in: decoded)
+            for match in regex.matches(in: decoded, range: range) {
+                let group = match.numberOfRanges > 1 ? 1 : 0
+                guard let capture = Range(match.range(at: group), in: decoded) else { continue }
+                let raw = String(decoded[capture])
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"' ;"))
+                if let absolute = URL(string: raw, relativeTo: responseURL)?.absoluteURL.absoluteString {
+                    candidates.append(absolute)
+                }
+            }
+        }
+        return Array(NSOrderedSet(array: candidates)) as? [String] ?? candidates
     }
 
     private func parsePortalConfig(from text: String) throws -> CampusParameters {
@@ -1011,6 +1090,21 @@ extension String {
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: "\\n")
             .replacingOccurrences(of: "\r", with: "\\r")
+    }
+
+    var htmlEntityDecodedForService: String {
+        var decoded = self
+        for (entity, value) in [
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&#39;", "'"),
+            ("&apos;", "'"),
+            ("&amp;", "&")
+        ] {
+            decoded = decoded.replacingOccurrences(of: entity, with: value, options: [.caseInsensitive])
+        }
+        return decoded
     }
 }
 
