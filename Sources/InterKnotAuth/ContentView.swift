@@ -278,6 +278,7 @@ private struct AccountView: View {
                     Button("登录") { model.login() }
                         .buttonStyle(.borderedProminent)
                     Button("注销") { model.logout() }
+                    Button("修改密码") { openPasswordChangePage() }
                 }
             }
 
@@ -332,6 +333,17 @@ private struct AccountView: View {
         }
         .formStyle(.grouped)
         .padding(18)
+    }
+
+    private func openPasswordChangePage() {
+        var components = URLComponents(string: "http://125.88.59.131:10001/qs/password.jsp")
+        components?.queryItems = [
+            URLQueryItem(name: "wlanuserip", value: model.settings.wlanUserIP),
+            URLQueryItem(name: "wlanacip", value: model.settings.wlanACIP)
+        ]
+        if let url = components?.url {
+            NSWorkspace.shared.open(url)
+        }
     }
 }
 
