@@ -45,7 +45,6 @@ final class AppModel: ObservableObject {
     private var probeGeneration = 0
     private var isLogoutInProgress = false
     private var isApplyingLaunchAtLogin = false
-    private var retryFailedLoginWithWatchdog = false
     private var lastSessionUsername = ""
 
     init() {
@@ -130,8 +129,6 @@ final class AppModel: ObservableObject {
 
         let willUseStudentDialer = shouldUseStudentDialer(for: request)
         let shouldRefreshUserIP = account == nil && settings.autoUpdateUserIP && !willUseStudentDialer
-        let wasWatchdogRunning = watchdog != nil
-        retryFailedLoginWithWatchdog = false
         stopWatchdog()
         guard validateBeforeLogin(request: request, allowRefreshParameters: shouldRefreshUserIP || willUseStudentDialer) else {
             return
@@ -139,12 +136,13 @@ final class AppModel: ObservableObject {
 
         connectionState = .loggingIn
         logLoginRoute(request, usesStudentDialer: willUseStudentDialer)
-        log("开始认证：\(request.username)，IP：\(request.userIP)")
+        log("准备认证：\(request.username)")
 
         loginTask = Task { [weak self] in
             guard let self else { return }
             do {
                 let preparedRequest = try await self.prepareLoginRequest(request, refreshUserIP: shouldRefreshUserIP)
+                self.log("开始认证：\(preparedRequest.username)，IP：\(preparedRequest.userIP)")
                 let result: LoginResult
                 let effectiveRequest: LoginRequest
                 if self.shouldUseStudentDialer(for: preparedRequest) {
@@ -218,7 +216,6 @@ final class AppModel: ObservableObject {
                         self.scheduleConnectivityCheck(generation: generation)
                     } else {
                         self.fail(result.message)
-                        self.restoreWatchdogAfterLoginFailure(wasRunning: wasWatchdogRunning)
                     }
                 }
             } catch is CancellationError {
@@ -230,8 +227,6 @@ final class AppModel: ObservableObject {
                 await MainActor.run {
                     guard self.isCurrentLogin(generation) else { return }
                     self.fail(error.localizedDescription)
-                    let shouldRetry = self.isRetryableLoginTransportError(error)
-                    self.restoreWatchdogAfterLoginFailure(wasRunning: wasWatchdogRunning, retryLogin: shouldRetry)
                 }
             }
         }
@@ -244,7 +239,6 @@ final class AppModel: ObservableObject {
         loginTask?.cancel()
         cancelPendingCaptcha()
         isProbing = false
-        retryFailedLoginWithWatchdog = false
         stopWatchdog()
         let requestedUsername = settings.username
         let sessionSignature = requestedUsername == lastSessionUsername ? lastSignature : ""
@@ -355,8 +349,16 @@ final class AppModel: ObservableObject {
                 }
             } catch {
                 await MainActor.run {
-                    self.fail("自动获取认证参数失败：\(error.localizedDescription)")
-                    self.log("请关闭代理，并开启浏览器无痕模式访问 2.2.2.2；如果能跳转，把完整地址复制到账号页手动解析", level: "INFO")
+                    if let localIP = NetworkInterfaceService.localIPv4Address(),
+                       !self.settings.esurfingURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       !self.settings.wlanACIP.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       self.settings.wlanACIP != "0.0.0.0" {
+                        self.settings.wlanUserIP = localIP
+                        self.missingFields.subtract([.wlanUserIP])
+                        self.log("自动获取成功")
+                    } else {
+                        self.fail("无法获取认证 IP，请检查校园网连接")
+                    }
                 }
             }
         }
@@ -416,18 +418,11 @@ final class AppModel: ObservableObject {
 
     func startWatchdogIfNeeded() {
         guard settings.enableWatchdog else { return }
+        guard case .connected = connectionState else { return }
         watchdog?.stop()
         let service = WatchdogService(
             probeURLs: settings.probeURLs,
             hasLocalIP: { NetworkInterfaceService.localIPv4Address() != nil },
-            shouldReconnect: { [weak self] in
-                await MainActor.run {
-                    guard let self, !self.isLogoutInProgress, self.connectionState != .loggingOut else {
-                        return false
-                    }
-                    return self.retryFailedLoginWithWatchdog
-                }
-            },
             reconnect: { [weak self] in
                 Task { @MainActor in
                     guard let self, !self.isLogoutInProgress, self.connectionState != .loggingOut else { return }
@@ -449,10 +444,13 @@ final class AppModel: ObservableObject {
     }
 
     func stopWatchdog() {
+        let wasRunning = watchdog != nil
         watchdog?.stop()
         watchdog = nil
         watchdogState = "未启动"
-        log("看门狗已停止")
+        if wasRunning {
+            log("看门狗已停止")
+        }
     }
 
     func startEasyTierServer() {
@@ -663,7 +661,13 @@ final class AppModel: ObservableObject {
             prepared.userIP = params.wlanUserIP
             log("自动更新认证 IP 成功：\(params.wlanUserIP)，保留认证网关：\(settings.esurfingURL)")
         } catch {
-            log("自动更新认证 IP 失败：\(error.localizedDescription)，继续使用当前配置", level: "ERROR")
+            guard let localIP = NetworkInterfaceService.localIPv4Address() else {
+                throw AppError.requestFailed("无法获取认证 IP，请检查校园网连接")
+            }
+            settings.wlanUserIP = localIP
+            missingFields.subtract([.wlanUserIP])
+            prepared.userIP = localIP
+            log("自动更新认证 IP 成功：\(localIP)")
         }
 
         guard !settings.esurfingURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -805,34 +809,4 @@ final class AppModel: ObservableObject {
         log(message, level: "ERROR")
     }
 
-    private func restoreWatchdogAfterLoginFailure(wasRunning: Bool, retryLogin: Bool = false) {
-        guard settings.enableWatchdog, wasRunning || retryLogin else { return }
-        retryFailedLoginWithWatchdog = retryLogin
-        if retryLogin {
-            log("认证请求失败，将由看门狗继续重试")
-        }
-        startWatchdogIfNeeded()
-    }
-
-    private func isRetryableLoginTransportError(_ error: Error) -> Bool {
-        let nsError = error as NSError
-        guard nsError.domain == NSURLErrorDomain else {
-            return false
-        }
-        let code = URLError.Code(rawValue: nsError.code)
-
-        switch code {
-        case .notConnectedToInternet,
-             .networkConnectionLost,
-             .timedOut,
-             .cannotFindHost,
-             .cannotConnectToHost,
-             .dnsLookupFailed,
-             .secureConnectionFailed,
-             .cannotLoadFromNetwork:
-            return true
-        default:
-            return false
-        }
-    }
 }

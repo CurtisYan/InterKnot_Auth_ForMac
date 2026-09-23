@@ -390,7 +390,10 @@ final class AuthenticationService: NSObject, URLSessionTaskDelegate {
         let targetURL = try url(target)
         var request = URLRequest(url: targetURL)
         request.timeoutInterval = 7
-        request.setValue("CCTP/android64_vpn/2093", forHTTPHeaderField: "User-Agent")
+        // The teacher web portal selects a different redirect route for the Android
+        // dialer user agent. Parameter discovery must behave like the browser flow
+        // the user gets from visiting 2.2.2.2.
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("text/html,text/xml,application/xhtml+xml,application/x-javascript,*/*", forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: request)
 
@@ -479,7 +482,9 @@ final class AuthenticationService: NSObject, URLSessionTaskDelegate {
         if let data = response.data(using: .utf8),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             let code = String(describing: json["resultCode"] ?? "")
-            let info = String(describing: json["resultInfo"] ?? "认证成功")
+            let rawInfo = String(describing: json["resultInfo"] ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let info = rawInfo.isEmpty ? "认证成功" : rawInfo
             if code == "0" {
                 return LoginResult(success: true, message: info, signature: signature)
             }
@@ -661,7 +666,6 @@ final class WatchdogService {
     private static let intervalSeconds = 15
     private let probeURLs: [String]
     private let hasLocalIP: () -> Bool
-    private let shouldReconnect: () async -> Bool
     private let reconnect: () -> Void
     private let logger: (String) -> Void
     private var task: Task<Void, Never>?
@@ -671,13 +675,11 @@ final class WatchdogService {
     init(
         probeURLs: [String],
         hasLocalIP: @escaping () -> Bool,
-        shouldReconnect: @escaping () async -> Bool,
         reconnect: @escaping () -> Void,
         logger: @escaping (String) -> Void
     ) {
         self.probeURLs = probeURLs
         self.hasLocalIP = hasLocalIP
-        self.shouldReconnect = shouldReconnect
         self.reconnect = reconnect
         self.logger = logger
     }
@@ -701,13 +703,6 @@ final class WatchdogService {
             try? await Task.sleep(nanoseconds: UInt64(Self.intervalSeconds) * 1_000_000_000)
             guard !Task.isCancelled else { return }
             guard hasLocalIP() else { continue }
-
-            if await shouldReconnect() {
-                guard !Task.isCancelled else { return }
-                logger("看门狗检测到认证请求失败，准备重连")
-                tryReconnect()
-                continue
-            }
 
             let reachable = await anyProbeReachable()
             guard !Task.isCancelled else { return }
@@ -1028,20 +1023,29 @@ enum NetworkInterfaceService {
         guard getifaddrs(&interfaces) == 0, let first = interfaces else { return nil }
         defer { freeifaddrs(interfaces) }
 
+        var candidates: [(priority: Int, address: String)] = []
         var pointer: UnsafeMutablePointer<ifaddrs>? = first
         while let current = pointer {
             defer { pointer = current.pointee.ifa_next }
             let flags = Int32(current.pointee.ifa_flags)
             guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0 else { continue }
-            guard current.pointee.ifa_addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+            guard let address = current.pointee.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_INET) else { continue }
 
             let name = String(cString: current.pointee.ifa_name)
-            guard name.hasPrefix("en") || name.hasPrefix("bridge") || name.hasPrefix("utun") else { continue }
+            let priority: Int
+            switch name {
+            case "en0": priority = 0
+            case "en1": priority = 1
+            case let value where value.hasPrefix("en"): priority = 2
+            case let value where value.hasPrefix("bridge"): priority = 3
+            default: continue
+            }
 
             var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
             let result = getnameinfo(
-                current.pointee.ifa_addr,
-                socklen_t(current.pointee.ifa_addr.pointee.sa_len),
+                address,
+                socklen_t(address.pointee.sa_len),
                 &host,
                 socklen_t(host.count),
                 nil,
@@ -1050,9 +1054,10 @@ enum NetworkInterfaceService {
             )
             guard result == 0 else { continue }
             let ip = String(cString: host)
-            if !ip.isEmpty { return ip }
+            guard !ip.isEmpty, !ip.hasPrefix("169.254.") else { continue }
+            candidates.append((priority, ip))
         }
-        return nil
+        return candidates.min { lhs, rhs in lhs.priority < rhs.priority }?.address
     }
 }
 
