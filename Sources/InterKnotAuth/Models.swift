@@ -62,7 +62,7 @@ enum ConnectionState: Equatable {
         case .idle:
             return "等待认证"
         case .loggingIn:
-            return "正在和 ESurfing 网关通信"
+            return "正在认证并验证外网连通性"
         case .loggingOut:
             return "正在下线"
         case .connected(let message):

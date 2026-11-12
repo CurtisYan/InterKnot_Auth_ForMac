@@ -43,6 +43,7 @@ final class AppModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var loginGeneration = 0
     private var probeGeneration = 0
+    private var probeTask: Task<Void, Never>?
     private var isLogoutInProgress = false
     private var isApplyingLaunchAtLogin = false
     private var lastSessionUsername = ""
@@ -107,6 +108,10 @@ final class AppModel: ObservableObject {
             log("强制重连：取消当前认证请求")
         }
         loginTask?.cancel()
+        probeTask?.cancel()
+        probeGeneration += 1
+        isProbing = false
+        probeResults = []
         cancelPendingCaptcha()
         studentDialer.stopHeartbeat()
         loginGeneration += 1
@@ -155,6 +160,8 @@ final class AppModel: ObservableObject {
                             }
                         }
                     )
+                    try Task.checkCancellation()
+                    guard self.isCurrentLogin(generation) else { return }
                     var updatedRequest = preparedRequest
                     updatedRequest.userIP = studentResult.userIP
                     await MainActor.run {
@@ -192,32 +199,41 @@ final class AppModel: ObservableObject {
                     effectiveRequest = preparedRequest
                 }
 
-                await MainActor.run {
-                    guard self.isCurrentLogin(generation) else { return }
-                    if result.success {
-                        self.connectionState = .connected(result.message)
-                        if let signature = result.signature, !signature.isEmpty {
-                            self.lastSignature = signature
-                            self.lastSessionUsername = effectiveRequest.username
-                        } else if self.lastSessionUsername == effectiveRequest.username {
-                            self.lastSignature = ""
-                            self.lastSessionUsername = ""
+                guard self.isCurrentLogin(generation), !Task.isCancelled else { return }
+                guard result.success else { self.fail(result.message); return }
+                // Preserve the gateway session for logout even if internet access is blocked.
+                self.lastSignature = result.signature ?? ""
+                self.lastSessionUsername = effectiveRequest.username
+                self.log("网关返回：\(result.message)；正在验证外网连通性（最多 5 秒）")
+                self.isProbing = true
+                let verification = await self.probeService.measure(
+                    urlStrings: self.settings.probeURLs.isEmpty ? AppSettings.defaultProbeURLs : self.settings.probeURLs,
+                    stopOnFirstSuccess: true,
+                    onResult: { [weak self] result in
+                        await MainActor.run {
+                            guard let self, self.isCurrentLogin(generation), !Task.isCancelled else { return }
+                            self.logProbeResult(result)
                         }
-                        if self.settings.savePassword {
-                            self.credentialStore.save(password: self.password, for: effectiveRequest.username)
-                        } else {
-                            self.credentialStore.delete(account: effectiveRequest.username)
-                        }
-                        self.settings.username = effectiveRequest.username
-                        self.rememberAccount(effectiveRequest.username)
-                        self.configStore.save(self.settings)
-                        self.log(result.message)
-                        self.startWatchdogIfNeeded()
-                        self.scheduleConnectivityCheck(generation: generation)
-                    } else {
-                        self.fail(result.message)
-                    }
+                    })
+                guard self.isCurrentLogin(generation), !Task.isCancelled else { return }
+                self.isProbing = false
+                self.probeResults = verification
+                guard verification.contains(where: \.success) else {
+                    self.studentDialer.stopHeartbeat()
+                    self.fail("连接验证失败：5 秒内未确认外网可达，请检查认证参数或检测目标")
+                    return
                 }
+                self.connectionState = .connected(result.message)
+                if self.settings.savePassword {
+                    self.credentialStore.save(password: self.password, for: effectiveRequest.username)
+                } else {
+                    self.credentialStore.delete(account: effectiveRequest.username)
+                }
+                self.settings.username = effectiveRequest.username
+                self.rememberAccount(effectiveRequest.username)
+                self.configStore.save(self.settings)
+                self.log("连接验证成功：\(result.message)")
+                self.startWatchdogIfNeeded()
             } catch is CancellationError {
                 await MainActor.run {
                     guard self.isCurrentLogin(generation) else { return }
@@ -236,6 +252,8 @@ final class AppModel: ObservableObject {
         isLogoutInProgress = true
         loginGeneration += 1
         probeGeneration += 1
+        probeTask?.cancel()
+        studentDialer.stopHeartbeat()
         loginTask?.cancel()
         cancelPendingCaptcha()
         isProbing = false
@@ -348,18 +366,7 @@ final class AppModel: ObservableObject {
                     self.log("自动获取成功：\(params.esurfingURL), \(params.wlanACIP), \(params.wlanUserIP)")
                 }
             } catch {
-                await MainActor.run {
-                    if let localIP = NetworkInterfaceService.localIPv4Address(),
-                       !self.settings.esurfingURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                       !self.settings.wlanACIP.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                       self.settings.wlanACIP != "0.0.0.0" {
-                        self.settings.wlanUserIP = localIP
-                        self.missingFields.subtract([.wlanUserIP])
-                        self.log("自动获取成功")
-                    } else {
-                        self.fail("无法获取认证 IP，请检查校园网连接")
-                    }
-                }
+                self.log("自动获取失败：\(error.localizedDescription)；请连接校园网，或使用手动解析", level: "ERROR")
             }
         }
     }
@@ -389,31 +396,37 @@ final class AppModel: ObservableObject {
     }
 
     func checkConnectivity() {
+        guard connectionState != .loggingIn else { return }
         guard !isProbing else { return }
         guard !isLogoutInProgress, connectionState != .loggingOut else { return }
         isProbing = true
         probeGeneration += 1
         let generation = probeGeneration
-        log("开始访问目标检测")
-        Task { [weak self] in
+        probeResults = []
+        log("开始访问目标检测（并发，最多 5 秒）")
+        probeTask = Task { [weak self] in
             guard let self else { return }
-            let results = await probeService.measure(urlStrings: settings.probeURLs)
-            await MainActor.run {
-                guard generation == self.probeGeneration,
-                      !self.isLogoutInProgress,
-                      self.connectionState != .loggingOut else {
-                    self.isProbing = false
-                    return
+            let results = await probeService.measure(urlStrings: settings.probeURLs, onResult: { [weak self] result in
+                await MainActor.run {
+                    guard let self, generation == self.probeGeneration else { return }
+                    self.probeResults.append(result)
+                    self.logProbeResult(result)
                 }
-                self.probeResults = results
-                self.isProbing = false
-                if let fastest = results.filter(\.success).compactMap(\.latencyMS).min() {
-                    self.log("访问检测完成，最快 \(fastest) ms")
-                } else {
-                    self.log("外网访问检测失败：所有检测点不可达，认证已成功但网络可能尚未放行或检测点被拦截", level: "ERROR")
-                }
+            })
+            guard generation == self.probeGeneration, !Task.isCancelled else { return }
+            self.probeResults = results
+            self.isProbing = false
+            if let fastest = results.filter(\.success).compactMap(\.latencyMS).min() {
+                self.log("访问检测完成，最快 \(fastest) ms")
+            } else {
+                self.fail("外网访问检测失败：所有检测点不可达，未确认连接成功")
             }
         }
+    }
+
+    private func logProbeResult(_ result: ProbeResult) {
+        log("检测 \(result.target)：\(result.message)" + (result.latencyMS.map { "，\($0) ms" } ?? ""),
+            level: result.success ? "INFO" : "ERROR")
     }
 
     func startWatchdogIfNeeded() {
@@ -558,14 +571,6 @@ final class AppModel: ObservableObject {
         return result
     }
 
-    private func scheduleConnectivityCheck(generation: Int) {
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            guard self.isCurrentLogin(generation) else { return }
-            self.checkConnectivity()
-        }
-    }
-
     private func reconcileLaunchAtLogin() {
         applyLaunchAtLogin(settings.launchAtLogin, quiet: true)
     }
@@ -655,19 +660,16 @@ final class AppModel: ObservableObject {
         var prepared = request
         do {
             let params = try await authenticator.detectParameters()
+            try Task.checkCancellation()
+            settings.esurfingURL = params.esurfingURL
             settings.wlanACIP = params.wlanACIP
             settings.wlanUserIP = params.wlanUserIP
-            missingFields.subtract([.wlanACIP, .wlanUserIP])
+            missingFields.subtract([.esurfingURL, .wlanACIP, .wlanUserIP])
             prepared.userIP = params.wlanUserIP
-            log("自动更新认证 IP 成功：\(params.wlanUserIP)，保留认证网关：\(settings.esurfingURL)")
+            log("自动更新认证 IP 成功：\(params.wlanUserIP)，认证网关：\(settings.esurfingURL)")
         } catch {
-            guard let localIP = NetworkInterfaceService.localIPv4Address() else {
-                throw AppError.requestFailed("无法获取认证 IP，请检查校园网连接")
-            }
-            settings.wlanUserIP = localIP
-            missingFields.subtract([.wlanUserIP])
-            prepared.userIP = localIP
-            log("自动更新认证 IP 成功：\(localIP)")
+            try Task.checkCancellation()
+            throw AppError.requestFailed("自动更新认证参数失败：\(error.localizedDescription)；请手动解析跳转地址，或关闭自动更新后使用已确认的参数")
         }
 
         guard !settings.esurfingURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -805,6 +807,8 @@ final class AppModel: ObservableObject {
     }
 
     private func fail(_ message: String) {
+        studentDialer.stopHeartbeat()
+        stopWatchdog()
         connectionState = .failed(message)
         log(message, level: "ERROR")
     }

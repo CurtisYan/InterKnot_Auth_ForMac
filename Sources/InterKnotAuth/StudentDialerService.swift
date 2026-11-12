@@ -18,8 +18,10 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
     private static let portalEnd = "//config.campus.js.chinatelecom.com-->"
     private static let initialAlgoID = "00000000-0000-0000-0000-000000000000"
 
+    private let configuration: URLSessionConfiguration
+
     private lazy var session: URLSession = {
-        let configuration = URLSessionConfiguration.default
+        let configuration = self.configuration
         configuration.timeoutIntervalForRequest = 10
         configuration.timeoutIntervalForResource = 20
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -32,7 +34,8 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
         activeSession?.termURL.isEmpty == false
     }
 
-    override init() {
+    init(configuration: URLSessionConfiguration = .default) {
+        self.configuration = configuration
         super.init()
     }
 
@@ -48,26 +51,21 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
 
     func login(request: LoginRequest, logger: @escaping (String) -> Void) async throws -> StudentDialerLoginResult {
         stopHeartbeat()
-        if let state = activeSession, !state.termURL.isEmpty {
-            logger("学生端：复用本程序已建立的客户端会话")
-            startHeartbeat(logger: logger)
-            return StudentDialerLoginResult(
-                result: LoginResult(success: true, message: "学生端会话已连接", signature: Self.signatureMarker),
-                userIP: state.config.userIP,
-                acIP: state.config.acIP
-            )
-        }
+        // A cached keep/term URL does not prove that the old session is still online.
         logger("学生端：检测客户端认证配置")
         let clientID = UUID().uuidString.lowercased()
-        let configStatus = try await detectConfig(clientID: clientID)
+        let configStatus = try await withNetworkDeadline { try await self.detectConfig(clientID: clientID) }
         guard case .requiresAuthorization(let config) = configStatus else {
+            try Task.checkCancellation()
             logger("学生端：当前网络已联网，未返回客户端认证配置")
+            startHeartbeat(logger: logger)
             return StudentDialerLoginResult(
-                result: LoginResult(success: true, message: "学生端检测到当前网络已连接；如果不是本程序建立的会话，将不能使用本程序主动下线", signature: nil),
-                userIP: request.userIP,
-                acIP: ""
+                result: LoginResult(success: true, message: "学生端联网检测通过", signature: canTerminateActiveSession ? Self.signatureMarker : nil),
+                userIP: activeSession?.config.userIP ?? request.userIP,
+                acIP: activeSession?.config.acIP ?? ""
             )
         }
+        activeSession = nil
         logger("学生端：认证 IP \(config.userIP)，AC IP \(config.acIP)")
 
         var state = StudentSession(
@@ -126,6 +124,7 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
             )
         }
 
+        try Task.checkCancellation()
         activeSession = state
         startHeartbeat(logger: logger)
         return StudentDialerLoginResult(
@@ -192,6 +191,11 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
         }
         let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .gb18030Student) ?? ""
         guard let portal = Self.extractBetween(Self.portalStart, Self.portalEnd, in: text), !portal.isEmpty else {
+            guard response.statusCode == 204,
+                  response.url?.host == URL(string: Self.captiveURL)?.host,
+                  data.isEmpty else {
+                throw AppError.requestFailed("学生端：未返回有效认证配置，响应也不符合联网检测预期，不能判定登录成功")
+            }
             return .connected
         }
         guard let configURLs = Self.extractConfigURLs(from: portal),

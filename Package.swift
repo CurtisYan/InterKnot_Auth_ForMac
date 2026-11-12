@@ -10,6 +10,7 @@ let package = Package(
         .executableTarget(
             name: "InterKnotAuth",
             dependencies: []
-        )
+        ),
+        .testTarget(name: "InterKnotAuthTests", dependencies: ["InterKnotAuth"])
     ]
 )

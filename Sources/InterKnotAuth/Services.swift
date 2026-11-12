@@ -145,16 +145,19 @@ final class CredentialStore {
 
 final class AuthenticationService: NSObject, URLSessionTaskDelegate {
     private var session: URLSession!
+    private let discoveryClient: DirectHTTPClient
 
     private struct LoginAttempt {
         let result: LoginResult
         let usedAutomaticCaptcha: Bool
     }
 
-    override init() {
+    init(discoveryClient: DirectHTTPClient = .shared) {
+        self.discoveryClient = discoveryClient
         super.init()
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 8
+        configuration.timeoutIntervalForResource = 8
         configuration.httpCookieStorage = .shared
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
@@ -301,30 +304,22 @@ final class AuthenticationService: NSObject, URLSessionTaskDelegate {
         return try classifyLogoutResponse(response.text)
     }
 
-    func detectParameters() async throws -> CampusParameters {
-        var errors: [String] = []
-        for target in [
-            "http://189.cn/",
-            "http://2.2.2.2/",
-            "https://2.2.2.2/",
-            "http://captive.apple.com/hotspot-detect.html",
-            "http://connect.rom.miui.com/generate_204",
-            "http://www.msftconnecttest.com/connecttest.txt"
-        ] {
-            do {
-                let params = try await detectParameters(from: target)
-                do {
-                    try await validateCampusParameters(params)
-                    return params
-                } catch {
-                    errors.append("\(params.esurfingURL)：\(error.localizedDescription)")
+    func detectParameters(targets: [String] = [
+        "http://2.2.2.2/", "https://2.2.2.2/", "http://189.cn/",
+        "http://captive.apple.com/hotspot-detect.html", "http://connect.rom.miui.com/generate_204"
+    ]) async throws -> CampusParameters {
+        try await withNetworkDeadline {
+            try await withThrowingTaskGroup(of: CampusParameters?.self) { group in
+                for target in targets {
+                    group.addTask { try? await self.detectParameters(from: target) }
                 }
-            } catch {
-                errors.append(error.localizedDescription)
+                defer { group.cancelAll() }
+                for try await params in group {
+                    if let params { return params }
+                }
+                throw AppError.requestFailed("未获取到校园网认证参数，请连接校园网后重试或手动解析跳转地址")
             }
         }
-        let details = Array(Set(errors)).prefix(3).joined(separator: "；")
-        throw AppError.requestFailed(details.isEmpty ? "没有收到广东天翼重定向 URL" : details)
     }
 
     func parseParameters(from redirectURL: String) throws -> CampusParameters {
@@ -332,20 +327,21 @@ final class AuthenticationService: NSObject, URLSessionTaskDelegate {
         guard !trimmed.isEmpty else {
             throw AppError.requestFailed("请输入 2.2.2.2 跳转后的完整地址")
         }
-        guard let components = URLComponents(string: trimmed),
+        guard let components = URLComponents(string: trimmed.htmlEntityDecodedForService),
               let host = components.host else {
             throw AppError.requestFailed("无法识别跳转地址")
         }
 
         let port = components.port.map { ":\($0)" } ?? ""
-        let esurfingURL = "\(host)\(port)"
+        let authority = "\(host)\(port)"
+        let esurfingURL = components.scheme?.lowercased() == "https" ? "https://\(authority)" : authority
         let queryItems = components.queryItems ?? []
         let wlanACIP = queryItems.first { $0.name.lowercased() == "wlanacip" }?.value
         let wlanUserIP = queryItems.first { $0.name.lowercased() == "wlanuserip" }?.value
 
-        guard let wlanACIP, !wlanACIP.isEmpty,
-              let wlanUserIP, !wlanUserIP.isEmpty else {
-            throw AppError.requestFailed("跳转地址中没有 wlanacip 或 wlanuserip")
+        guard let wlanACIP, IPv4Address(wlanACIP) != nil, wlanACIP != "0.0.0.0",
+              let wlanUserIP, IPv4Address(wlanUserIP) != nil, wlanUserIP != "0.0.0.0" else {
+            throw AppError.requestFailed("跳转地址中没有有效的 wlanacip 或 wlanuserip")
         }
 
         return CampusParameters(esurfingURL: esurfingURL, wlanACIP: wlanACIP, wlanUserIP: wlanUserIP)
@@ -387,59 +383,36 @@ final class AuthenticationService: NSObject, URLSessionTaskDelegate {
     }
 
     private func detectParameters(from target: String) async throws -> CampusParameters {
-        let targetURL = try url(target)
-        var request = URLRequest(url: targetURL)
-        request.timeoutInterval = 7
-        // The teacher web portal selects a different redirect route for the Android
-        // dialer user agent. Parameter discovery must behave like the browser flow
-        // the user gets from visiting 2.2.2.2.
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        request.setValue("text/html,text/xml,application/xhtml+xml,application/x-javascript,*/*", forHTTPHeaderField: "Accept")
-        let (data, response) = try await session.data(for: request)
-
-        let responseURL = (response as? HTTPURLResponse)?.url ?? targetURL
-        if let finalURL = (response as? HTTPURLResponse)?.url?.absoluteString,
-           finalURL != target,
-           let params = try? parseParameters(from: finalURL) {
-            return params
-        }
-
-        let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .gb18030) ?? ""
-        for candidate in redirectURLCandidates(from: text, responseURL: responseURL) {
-            if let params = try? parseParameters(from: candidate) {
-                return params
+        var currentURL = try url(target)
+        for _ in 0..<5 {
+            try Task.checkCancellation()
+            if let params = try? parseParameters(from: currentURL.absoluteString) { return params }
+            var request = URLRequest(url: currentURL)
+            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            request.setValue("text/html,*/*", forHTTPHeaderField: "Accept")
+            let (data, response) = try await discoveryClient.data(for: request)
+            let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .gb18030) ?? ""
+            // Inspect Location before fetching the destination: it may be unreachable,
+            // or redirect again and discard the original wlanuserip/wlanacip.
+            let location = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Location")
+                .flatMap { URL(string: $0.htmlEntityDecodedForService, relativeTo: currentURL)?.absoluteURL }
+            if let location, let params = try? parseParameters(from: location.absoluteString) { return params }
+            let candidates = redirectURLCandidates(from: text, responseURL: currentURL)
+            for candidate in candidates {
+                if let params = try? parseParameters(from: candidate) { return params }
             }
+            if let params = try? parsePortalConfig(from: text.htmlEntityDecodedForService) { return params }
+            guard let next = location ?? candidates.first.flatMap(URL.init(string:)) else { break }
+            currentURL = next
         }
-        if let params = try? parsePortalConfig(from: text) {
-            return params
-        }
-
         throw AppError.requestFailed("没有收到广东天翼重定向 URL")
-    }
-
-    private func validateCampusParameters(_ params: CampusParameters) async throws {
-        let base = normalizeBaseURL(params.esurfingURL)
-        let pageURL = try url("\(base)/qs/index_gz.jsp?wlanacip=\(params.wlanACIP.urlFormEscaped)&wlanuserip=\(params.wlanUserIP.urlFormEscaped)")
-        let pageHTML = try await fetchText(pageURL)
-        let lower = pageHTML.lowercased()
-        guard extractCaptchaURL(from: pageHTML, pageURL: pageURL) != nil
-                || lower.contains("image_code")
-                || lower.contains("/ajax/login")
-                || lower.contains("index_gz.jsp")
-                || lower.contains("wlanuserip")
-                || lower.contains("验证码")
-                || lower.contains("登录") else {
-            throw AppError.requestFailed("认证页面无效：\(pageURL.absoluteString)")
-        }
     }
 
     private func redirectURLCandidates(from text: String, responseURL: URL) -> [String] {
         let decoded = text.htmlEntityDecodedForService
         let patterns = [
-            #"https?://[^\s"'<>]+[?&]wlanacip=[^\s"'<>]+[&;]wlanuserip=[^\s"'<>]+"#,
-            #"(?i)url\s*=\s*['"]?([^'"\s<>]+[?&]wlanacip=[^'"\s<>]+[&;]wlanuserip=[^'"\s<>]+)"#,
-            #"(?i)location(?:\.href)?\s*=\s*['"]([^'"]+[?&]wlanacip=[^'"]+[&;]wlanuserip=[^'"]+)['"]"#,
-            #"(?i)content\s*=\s*['"][^'"]*url=([^'"]+[?&]wlanacip=[^'"]+[&;]wlanuserip=[^'"]+)['"]"#
+            #"https?://[^\s"'<>]+"#,
+            #"(?i)(?:url\s*=|location(?:\.href)?\s*=)\s*['"]?([^'"\s<>]+)"#
         ]
         var candidates: [String] = []
         for pattern in patterns {
@@ -609,55 +582,51 @@ final class AuthenticationService: NSObject, URLSessionTaskDelegate {
 }
 
 final class ConnectivityProbeService {
-    func measure(urlStrings: [String]) async -> [ProbeResult] {
-        var results: [ProbeResult] = []
-        for item in urlStrings where !item.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            results.append(await measure(urlString: item))
+    private let client: DirectHTTPClient
+
+    init(client: DirectHTTPClient = .shared) { self.client = client }
+    func measure(urlStrings: [String], stopOnFirstSuccess: Bool = false,
+                 onResult: ((ProbeResult) async -> Void)? = nil) async -> [ProbeResult] {
+        let targets = urlStrings.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return await withTaskGroup(of: (Int, ProbeResult).self) { group in
+            for (index, target) in targets.enumerated() {
+                group.addTask { (index, await self.measure(urlString: target)) }
+            }
+            var results: [(Int, ProbeResult)] = []
+            for await item in group {
+                guard !Task.isCancelled else { group.cancelAll(); break }
+                results.append(item)
+                await onResult?(item.1)
+                if stopOnFirstSuccess && item.1.success { group.cancelAll(); break }
+            }
+            return results.sorted { $0.0 < $1.0 }.map { $0.1 }
         }
-        return results
     }
 
     private func measure(urlString: String) async -> ProbeResult {
-        let normalized = urlString.hasPrefix("http://") || urlString.hasPrefix("https://")
-            ? urlString
-            : "https://\(urlString)"
-        guard let url = URL(string: normalized) else {
-            return ProbeResult(
-                target: urlString,
-                success: false,
-                latencyMS: nil,
-                statusCode: nil,
-                message: "URL 无效",
-                checkedAt: Date()
-            )
+        let target = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = target.hasPrefix("http://") || target.hasPrefix("https://") ? target : "https://\(target)"
+        guard let url = URL(string: normalized), let host = url.host, ["http", "https"].contains(url.scheme) else {
+            return ProbeResult(target: urlString, success: false, latencyMS: nil, statusCode: nil, message: "URL 无效", checkedAt: Date())
         }
-
+        let knownBody = host == "www.msftconnecttest.com" || host == "captive.apple.com"
         var request = URLRequest(url: url)
-        request.httpMethod = "HEAD"
-        request.timeoutInterval = 5
+        request.httpMethod = knownBody || url.path.contains("generate_204") ? "GET" : "HEAD"
         let start = Date()
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            let elapsed = Int(Date().timeIntervalSince(start) * 1000)
+            let (data, response) = try await client.data(for: request)
             let code = (response as? HTTPURLResponse)?.statusCode
-            let ok = code.map { (200..<500).contains($0) } ?? false
-            return ProbeResult(
-                target: normalized,
-                success: ok,
-                latencyMS: elapsed,
-                statusCode: code,
-                message: ok ? "可达" : "HTTP 异常",
-                checkedAt: Date()
-            )
+            let body = String(data: data, encoding: .utf8) ?? ""
+            let ok: Bool
+            if url.path.contains("generate_204") { ok = code == 204 }
+            else if host == "www.msftconnecttest.com" { ok = code == 200 && body.trimmingCharacters(in: .whitespacesAndNewlines) == "Microsoft Connect Test" }
+            else if host == "captive.apple.com" { ok = code == 200 && body.contains("<BODY>Success</BODY>") }
+            else { ok = code.map { (200..<300).contains($0) } ?? false }
+            return ProbeResult(target: normalized, success: ok, latencyMS: Int(Date().timeIntervalSince(start) * 1000),
+                               statusCode: code, message: ok ? "可达" : "响应不符合预期，可能被认证网关拦截（HTTP \(code ?? 0)）", checkedAt: Date())
         } catch {
-            return ProbeResult(
-                target: normalized,
-                success: false,
-                latencyMS: nil,
-                statusCode: nil,
-                message: error.localizedDescription,
-                checkedAt: Date()
-            )
+            return ProbeResult(target: normalized, success: false, latencyMS: nil, statusCode: nil,
+                               message: (error as? URLError)?.code == .timedOut ? "检测超时（5 秒）" : error.localizedDescription, checkedAt: Date())
         }
     }
 }
@@ -727,37 +696,13 @@ final class WatchdogService {
     }
 
     private func anyProbeReachable() async -> Bool {
-        for item in probeURLs {
-            guard !Task.isCancelled else { return true }
-            let normalized = item.hasPrefix("http://") || item.hasPrefix("https://")
-                ? item
-                : "https://\(item)"
-            guard let url = URL(string: normalized) else { continue }
-            let probe = watchdogProbe(for: normalized)
-            var request = URLRequest(url: url)
-            request.httpMethod = probe.method
-            request.timeoutInterval = 4
-            if let (_, response) = try? await URLSession.shared.data(for: request),
-               let code = (response as? HTTPURLResponse)?.statusCode,
-               ![301, 302, 303, 307, 308].contains(code),
-               probe.isExpectedStatus(code) {
-                reconnectCooldown = Self.intervalSeconds
-                return true
-            }
-            guard !Task.isCancelled else { return true }
+        let results = await ConnectivityProbeService().measure(
+            urlStrings: probeURLs.isEmpty ? AppSettings.defaultProbeURLs : probeURLs, stopOnFirstSuccess: true)
+        if results.contains(where: \.success) {
+            reconnectCooldown = Self.intervalSeconds
+            return true
         }
         return false
-    }
-
-    private func watchdogProbe(for url: String) -> (method: String, isExpectedStatus: (Int) -> Bool) {
-        if url.contains("generate_204") {
-            return ("GET", { $0 == 204 })
-        }
-        if url.contains("msftconnecttest.com/connecttest.txt")
-            || url.contains("captive.apple.com/hotspot-detect.html") {
-            return ("HEAD", { $0 == 200 })
-        }
-        return ("HEAD", { (200..<500).contains($0) })
     }
 }
 
