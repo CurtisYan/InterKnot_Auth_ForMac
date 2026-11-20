@@ -47,6 +47,9 @@ final class AppModel: ObservableObject {
     private var isLogoutInProgress = false
     private var isApplyingLaunchAtLogin = false
     private var lastSessionUsername = ""
+    private var recoveryRequest: LoginRequest?
+    private var recoveryRequiresParameterRefresh = false
+    private var isAutomaticLogin = false
 
     init() {
         var loaded = configStore.load()
@@ -95,12 +98,12 @@ final class AppModel: ObservableObject {
         log("已删除账号历史：\(sanitized)")
     }
 
-    func login(account: MultiLoginAccount? = nil, force: Bool = false) {
+    func login(account: MultiLoginAccount? = nil, force: Bool = false, automatic: Bool = false) {
         guard !isLogoutInProgress else {
             log("正在注销，已忽略登录请求")
             return
         }
-        if case .loggingIn = connectionState, !force {
+        if case .loggingIn = connectionState, (!force || automatic) {
             log("正在登录，已忽略重复登录请求")
             return
         }
@@ -117,9 +120,11 @@ final class AppModel: ObservableObject {
         loginGeneration += 1
         let generation = loginGeneration
 
-        let username = account?.username.isEmpty == false ? account!.username : settings.username
+        isAutomaticLogin = automatic
+        let username = automatic ? (recoveryRequest?.username ?? settings.username)
+            : (account?.username.isEmpty == false ? account!.username : settings.username)
         let userIP = account?.userIP.isEmpty == false ? account!.userIP : settings.wlanUserIP
-        if account == nil,
+        if !automatic, account == nil,
            password.isEmpty,
            settings.savePassword,
            let savedPassword = credentialStore.password(for: username, allowUserPrompt: true) {
@@ -127,18 +132,19 @@ final class AppModel: ObservableObject {
         }
         let request = LoginRequest(
             username: username,
-            password: password,
+            password: automatic ? (recoveryRequest?.password ?? password) : password,
             userIP: userIP,
             mode: settings.loginMode
         )
 
         let willUseStudentDialer = shouldUseStudentDialer(for: request)
-        let shouldRefreshUserIP = account == nil && settings.autoUpdateUserIP && !willUseStudentDialer
-        stopWatchdog()
+        let shouldRefreshUserIP = account == nil && !willUseStudentDialer
+            && (settings.autoUpdateUserIP || (automatic && recoveryRequiresParameterRefresh))
         guard validateBeforeLogin(request: request, allowRefreshParameters: shouldRefreshUserIP || willUseStudentDialer) else {
             return
         }
 
+        watchdog?.authenticationStarted()
         connectionState = .loggingIn
         logLoginRoute(request, usesStudentDialer: willUseStudentDialer)
         log("准备认证：\(request.username)")
@@ -147,6 +153,8 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             do {
                 let preparedRequest = try await self.prepareLoginRequest(request, refreshUserIP: shouldRefreshUserIP)
+                try Task.checkCancellation()
+                guard self.isCurrentLogin(generation) else { return }
                 self.log("开始认证：\(preparedRequest.username)，IP：\(preparedRequest.userIP)")
                 let result: LoginResult
                 let effectiveRequest: LoginRequest
@@ -200,7 +208,10 @@ final class AppModel: ObservableObject {
                 }
 
                 guard self.isCurrentLogin(generation), !Task.isCancelled else { return }
-                guard result.success else { self.fail(result.message); return }
+                guard result.success else {
+                    self.handleLoginFailure(result.message, pauseRecovery: AuthenticationFailurePolicy.shouldPause(result.message))
+                    return
+                }
                 // Preserve the gateway session for logout even if internet access is blocked.
                 self.lastSignature = result.signature ?? ""
                 self.lastSessionUsername = effectiveRequest.username
@@ -220,12 +231,15 @@ final class AppModel: ObservableObject {
                 self.probeResults = verification
                 guard verification.contains(where: \.success) else {
                     self.studentDialer.stopHeartbeat()
-                    self.fail("连接验证失败：5 秒内未确认外网可达，请检查认证参数或检测目标")
+                    self.handleLoginFailure("连接验证失败：5 秒内未确认外网可达，请检查认证参数或检测目标")
                     return
                 }
+                self.recoveryRequest = effectiveRequest
+                self.recoveryRequiresParameterRefresh = false
+                self.isAutomaticLogin = false
                 self.connectionState = .connected(result.message)
                 if self.settings.savePassword {
-                    self.credentialStore.save(password: self.password, for: effectiveRequest.username)
+                    self.credentialStore.save(password: effectiveRequest.password, for: effectiveRequest.username)
                 } else {
                     self.credentialStore.delete(account: effectiveRequest.username)
                 }
@@ -233,6 +247,7 @@ final class AppModel: ObservableObject {
                 self.rememberAccount(effectiveRequest.username)
                 self.configStore.save(self.settings)
                 self.log("连接验证成功：\(result.message)")
+                self.watchdog?.authenticationFinished(success: true)
                 self.startWatchdogIfNeeded()
             } catch is CancellationError {
                 await MainActor.run {
@@ -242,13 +257,20 @@ final class AppModel: ObservableObject {
             } catch {
                 await MainActor.run {
                     guard self.isCurrentLogin(generation) else { return }
-                    self.fail(error.localizedDescription)
+                    let needsConfiguration: Bool
+                    switch error {
+                    case AppError.invalidURL, AppError.rsaKeyUnavailable: needsConfiguration = true
+                    default: needsConfiguration = false
+                    }
+                    self.handleLoginFailure(error.localizedDescription, pauseRecovery: needsConfiguration)
                 }
             }
         }
     }
 
     func logout() {
+        recoveryRequest = nil
+        isAutomaticLogin = false
         isLogoutInProgress = true
         loginGeneration += 1
         probeGeneration += 1
@@ -418,8 +440,10 @@ final class AppModel: ObservableObject {
             self.isProbing = false
             if let fastest = results.filter(\.success).compactMap(\.latencyMS).min() {
                 self.log("访问检测完成，最快 \(fastest) ms")
+                self.watchdog?.reportReachability(true)
             } else {
-                self.fail("外网访问检测失败：所有检测点不可达，未确认连接成功")
+                self.markConnectivityLost("外网访问检测失败：所有检测点不可达，未确认连接成功")
+                self.watchdog?.reportReachability(false)
             }
         }
     }
@@ -430,30 +454,48 @@ final class AppModel: ObservableObject {
     }
 
     func startWatchdogIfNeeded() {
-        guard settings.enableWatchdog else { return }
+        guard settings.enableWatchdog, watchdog == nil, recoveryRequest != nil else { return }
         guard case .connected = connectionState else { return }
-        watchdog?.stop()
         let service = WatchdogService(
-            probeURLs: settings.probeURLs,
-            hasLocalIP: { NetworkInterfaceService.localIPv4Address() != nil },
+            probe: { [weak self] in
+                guard let self else { return false }
+                let targets = self.settings.probeURLs.isEmpty ? AppSettings.defaultProbeURLs : self.settings.probeURLs
+                return await self.probeService.measure(urlStrings: targets, stopOnFirstSuccess: true).contains(where: \.success)
+            },
             reconnect: { [weak self] in
-                Task { @MainActor in
-                    guard let self, !self.isLogoutInProgress, self.connectionState != .loggingOut else { return }
-                    self.log("看门狗触发重连")
-                    self.login(force: true)
+                guard let self, !self.isLogoutInProgress, self.recoveryRequest != nil else { return }
+                self.log("看门狗触发自动重连")
+                self.login(automatic: true)
+            },
+            stateChanged: { [weak self] phase in
+                guard let self else { return }
+                self.watchdogState = phase.title
+                switch phase {
+                case .waitingToRetry(let seconds): self.log("看门狗保留自动恢复，\(seconds) 秒后重试")
+                case .waitingForNetwork: self.log("看门狗等待网络恢复")
+                default: break
                 }
             },
-            logger: { [weak self] message in
-                Task { @MainActor in
-                    guard let self, !self.isLogoutInProgress, self.connectionState != .loggingOut else { return }
-                    self.log(message)
+            networkChanged: { [weak self] available in
+                guard let self else { return }
+                self.invalidateNetworkOperations()
+                self.recoveryRequiresParameterRefresh = true
+                self.connectionState = .recovering(available ? "网络发生变化，等待稳定后验证连通性" : "网络已断开，等待恢复后自动重连")
+                self.log(available ? "网络已恢复或切换，2 秒后重新检测" : "网络路径不可用，暂停请求并保留自动恢复")
+            },
+            reachabilityChanged: { [weak self] reachable in
+                guard let self, !self.isLogoutInProgress else { return }
+                if reachable {
+                    guard self.recoveryRequest != nil, self.connectionState != .loggingIn else { return }
+                    self.connectionState = .connected("看门狗已验证外网可达")
+                } else {
+                    self.markConnectivityLost("外网不可达，将自动重连")
                 }
             }
         )
         watchdog = service
         service.start()
-        watchdogState = "运行中"
-        log("看门狗已启动")
+        log("看门狗已启动：系统网络监听 + 30 秒检测兜底")
     }
 
     func stopWatchdog() {
@@ -461,9 +503,40 @@ final class AppModel: ObservableObject {
         watchdog?.stop()
         watchdog = nil
         watchdogState = "未启动"
-        if wasRunning {
-            log("看门狗已停止")
+        if wasRunning { log("看门狗已停止") }
+    }
+
+    private func invalidateNetworkOperations() {
+        loginGeneration += 1
+        probeGeneration += 1
+        loginTask?.cancel()
+        probeTask?.cancel()
+        cancelPendingCaptcha()
+        studentDialer.invalidateSession()
+        isProbing = false
+        probeResults = []
+        isAutomaticLogin = false
+    }
+
+    private func markConnectivityLost(_ message: String) {
+        studentDialer.stopHeartbeat()
+        connectionState = watchdog == nil ? .failed(message) : .recovering(message)
+        log(message, level: "ERROR")
+    }
+
+    private func handleLoginFailure(_ message: String, pauseRecovery: Bool = false) {
+        isAutomaticLogin = false
+        studentDialer.stopHeartbeat()
+        if pauseRecovery {
+            stopWatchdog()
+            recoveryRequest = nil
+            connectionState = .failed(message)
+            log("自动恢复已暂停，请检查账号配置后手动登录", level: "ERROR")
+        } else {
+            connectionState = watchdog == nil ? .failed(message) : .recovering(message)
+            watchdog?.authenticationFinished(success: false)
         }
+        log(message, level: "ERROR")
     }
 
     func startEasyTierServer() {
@@ -530,6 +603,36 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in
                     self?.persistSettings(settings)
                 }
+            }
+            .store(in: &cancellables)
+
+        $settings
+            .map(\.enableWatchdog)
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] enabled in
+                Task { @MainActor in
+                    guard let self, self.settings.enableWatchdog == enabled else { return }
+                    if enabled { self.startWatchdogIfNeeded() }
+                    else {
+                        if self.isAutomaticLogin {
+                            self.invalidateNetworkOperations()
+                            self.connectionState = .failed("自动重连已取消")
+                        }
+                        self.stopWatchdog()
+                    }
+                }
+            }
+            .store(in: &cancellables)
+
+        $settings
+            .sink { [weak self] value in
+                guard let self, let request = self.recoveryRequest,
+                      request.username != value.username || request.mode != value.loginMode else { return }
+                self.invalidateNetworkOperations()
+                self.stopWatchdog()
+                self.recoveryRequest = nil
+                self.connectionState = .idle
             }
             .store(in: &cancellables)
 
@@ -647,7 +750,7 @@ final class AppModel: ObservableObject {
             } else {
                 selectedSection = .accounts
             }
-            fail(validationMessage)
+            handleLoginFailure(validationMessage, pauseRecovery: true)
             return false
         }
         return true
@@ -808,7 +911,6 @@ final class AppModel: ObservableObject {
 
     private func fail(_ message: String) {
         studentDialer.stopHeartbeat()
-        stopWatchdog()
         connectionState = .failed(message)
         log(message, level: "ERROR")
     }

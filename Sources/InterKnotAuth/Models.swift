@@ -39,6 +39,7 @@ enum ConnectionState: Equatable {
     case idle
     case loggingIn
     case loggingOut
+    case recovering(String)
     case connected(String)
     case failed(String)
 
@@ -50,6 +51,8 @@ enum ConnectionState: Equatable {
             return "登录中"
         case .loggingOut:
             return "注销中"
+        case .recovering:
+            return "等待恢复"
         case .connected:
             return "已连接"
         case .failed:
@@ -66,6 +69,8 @@ enum ConnectionState: Equatable {
         case .loggingOut:
             return "正在下线"
         case .connected(let message):
+            return message
+        case .recovering(let message):
             return message
         case .failed(let message):
             return message
@@ -216,4 +221,15 @@ struct ProbeResult: Identifiable, Equatable {
     let statusCode: Int?
     let message: String
     let checkedAt: Date
+}
+
+/// Only explicit account/policy/user-action errors stop an established recovery session.
+/// Transport errors and parameter discovery failures remain retryable.
+enum AuthenticationFailurePolicy {
+    static func shouldPause(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return ["密码错误", "密码不正确", "账号不存在", "用户不存在", "账号或密码", "用户名或密码",
+                "没有订购", "没有定购", "未订购", "过于频繁", "操作频繁", "验证码未填写",
+                "invalid password", "incorrect password", "invalid credentials"].contains { lower.contains($0) }
+    }
 }

@@ -147,6 +147,11 @@ final class StudentDialerService: NSObject, URLSessionTaskDelegate {
         return "学生端下线请求已发送"
     }
 
+    func invalidateSession() {
+        stopHeartbeat()
+        activeSession = nil
+    }
+
     func stopHeartbeat() {
         heartbeatTask?.cancel()
         heartbeatTask = nil
